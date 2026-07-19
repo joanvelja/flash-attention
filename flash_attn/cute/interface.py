@@ -93,11 +93,17 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
-    is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    is_sm90_legacy_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    is_sm90_gemma4_shape = head_dim == 512 and head_dim_v == 512
     if compute_capability == 9:
-        assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        assert (
+            (is_sm90_legacy_range or is_sm90_gemma4_shape)
+            and head_dim % alignment == 0
+            and head_dim_v % alignment == 0
+        ), (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
-            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+            f"head_dim and head_dim_v must be between 8 and 256 or exactly (512, 512), "
+            f"and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
         assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_dedicate_kernel_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
@@ -144,9 +150,11 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
     elif head_dim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
+    elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
+    else:  # Gemma 4 hdim 512
+        return FwdConfig(64, 64, False, True)
 
 @dataclass(frozen=True)
 class BwdConfig:
@@ -421,6 +429,15 @@ def _flash_attn_fwd(
     alignment = 16 // q.element_size()
     if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+    is_sm90_gemma4_shape = arch // 10 == 9 and head_dim == 512 and head_dim_v == 512
+    if is_sm90_gemma4_shape and page_table is not None:
+        raise NotImplementedError("SM90 D512 paged KV is not implemented")
+    if num_splits < 1 and arch // 10 in [8, 9]:
+        # SM80/SM90 forward has no SplitKV kernel, so auto resolves to the only
+        # supported value instead of reaching the unsupported split dispatch.
+        num_splits = 1
+    if is_sm90_gemma4_shape and num_splits > 1:
+        raise NotImplementedError("SM90 D512 SplitKV is not implemented; num_splits must be 1 (or 0 = auto)")
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim) if qv is None else 1.0 / math.sqrt(head_dim + head_dim_v)
     if softcap == 0.0:
@@ -822,8 +839,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                # num_stages=1,
-                num_stages=2,
+                num_stages=1 if head_dim > 256 or head_dim_v > 256 else 2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -1383,6 +1399,8 @@ def _flash_attn_bwd(
     alignment = 16 // q.element_size()
     if arch // 10 != 12:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+    if arch // 10 == 9 and (head_dim > 256 or head_dim_v > 256):
+        raise NotImplementedError("SM90 D512 backward is not implemented")
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv

@@ -93,6 +93,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom
 
     def _get_tiled_mma(self):
+        # hdim(v) > 256 (D512): the PV accumulator exceeds one warpgroup's
+        # register file, so PV splits hdimv across two warpgroups. Both need the
+        # full P = softmax(S), so they compute the same QK tile explicitly.
+        atom_layout_n_pv = 2 if self.tile_hdim > 256 or self.tile_hdimv > 256 else 1
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
@@ -108,8 +112,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.MN,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
-            tiler_mn=(64, self.tile_hdimv),
+            atom_layout_mnk=(self.tile_m // 64, atom_layout_n_pv, 1),
+            tiler_mn=(64, min(256, self.tile_hdimv)),
             a_source=warpgroup.OperandSource.RMEM
             if self.mma_pv_is_rs
             else warpgroup.OperandSource.SMEM,
@@ -203,7 +207,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
-        self.num_mma_threads = tiled_mma_qk.size
+        self.num_mma_threads = max(tiled_mma_qk.size, tiled_mma_pv.size)
         self.num_threads_per_warp_group = 128
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
         assert self.num_wg_mma in [1, 2, 3]
@@ -956,8 +960,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         warp_group_thread_layout = cute.make_layout(
             self.num_wg_mma, stride=self.num_threads_per_warp_group
         )
-        thr_mma_qk = tiled_mma_qk.get_slice(tidx)
-        wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
+        # D512 has two PV warpgroups and one QK warpgroup. Slice QK modulo its
+        # size so the extra PV warpgroup computes the same complete score tile.
+        num_wg_mma_qk = tiled_mma_qk.size // self.num_threads_per_warp_group
+        qk_tidx = tidx % tiled_mma_qk.size
+        thr_mma_qk = tiled_mma_qk.get_slice(qk_tidx)
+        wg_mma_qk = tiled_mma_qk.get_slice(
+            (warp_group_idx % num_wg_mma_qk) * self.num_threads_per_warp_group
+        )
         wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
         _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
             wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
@@ -976,7 +986,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_copy_atom_P = utils.get_smem_store_atom(
             self.arch.major * 10 + self.arch.minor, self.dtype
         )
-        smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(tidx)
+        smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(qk_tidx)
         tPsP = smem_thr_copy_P.partition_D(sP) if const_expr(sP is not None) else None
         smem_copy_params = SimpleNamespace(smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP)
 
