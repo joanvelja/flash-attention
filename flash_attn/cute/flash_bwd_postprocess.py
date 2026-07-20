@@ -113,7 +113,10 @@ class FlashAttentionBackwardPostprocess:
                 Float32,
                 atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1])
                 + (1,),
-                tiler_mn=tiler_mn_dQ if not self.dQ_swapAB else tiler_mn_dQ[::-1],
+                tiler_mn=(
+                    64,
+                    tiler_mn_dQ[1] if not self.dQ_swapAB else tiler_mn_dQ[0],
+                ),
             )
         else:
             cta_group = tcgen05.CtaGroup.ONE

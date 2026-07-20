@@ -5,7 +5,7 @@ import torch
 from flash_attn.cute import flash_attn_func, flash_attn_varlen_func, utils
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
-from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
 pytestmark = pytest.mark.gpu
 
@@ -95,7 +95,7 @@ def _reference_varlen(
         (64, [197, 65], [197, 65], False, None, (None, None), True),
         (128, [73, 129], [137, 193], True, 0.37, (None, None), True),
         (256, [1057, 511], [1057, 511], True, 1.0, (1023, 0), True),
-        (512, [257, 129], [513, 385], True, 1.0, (None, None), False),
+        (512, [257, 129], [513, 385], True, 1.0, (None, None), True),
         (512, [200, 129], [264, 385], False, 1.0, (127, 15), False),
         (512, [0, 257, 129], [64, 513, 385], True, 1.0, (None, None), False),
     ],
@@ -103,7 +103,7 @@ def _reference_varlen(
         "legacy-d64",
         "legacy-d128-bottom-right",
         "gemma-local-d256",
-        "gemma-global-d512-forward",
+        "gemma-global-d512",
         "gemma-local-d512-forward",
         "gemma-zerolen-d512-forward",
     ),
@@ -180,6 +180,47 @@ def test_gemma4_sm90_varlen_canary(
             )
             assert relative_l2 < 1e-2
             assert torch.isfinite(actual).all()
+
+
+def test_gemma4_sm90_d512_fp16_batch_backward() -> None:
+    _assert_sm90()
+    torch.manual_seed(2512)
+    query_length, key_length = 129, 257
+    q = torch.randn(1, query_length, 16, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(1, key_length, 2, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    q_ref = q.detach().clone().requires_grad_()
+    k_ref = k.detach().clone().requires_grad_()
+    v_ref = v.detach().clone().requires_grad_()
+
+    output, _ = flash_attn_func(q, k, v, causal=True, return_lse=True)
+    output_ref, _ = _reference_dense(
+        q_ref[0],
+        k_ref[0],
+        v_ref[0],
+        512**-0.5,
+        True,
+        (None, None),
+    )
+    output_ref = output_ref.to(q.dtype).unsqueeze(0)
+    torch.testing.assert_close(output.float(), output_ref.float(), atol=3e-2, rtol=3e-2)
+
+    output_gradient = torch.randn_like(output)
+    output.backward(output_gradient)
+    output_ref.backward(output_gradient)
+    for name, actual, expected in (
+        ("dQ", q.grad, q_ref.grad),
+        ("dK", k.grad, k_ref.grad),
+        ("dV", v.grad, v_ref.grad),
+    ):
+        relative_l2 = _relative_l2(actual, expected)
+        print(
+            f"fp16-d512 {name}: relative_l2={relative_l2:.8f}, "
+            f"max_abs={float((actual.float() - expected.float()).abs().max()):.8f}",
+            flush=True,
+        )
+        assert relative_l2 < 1e-2
+        assert torch.isfinite(actual).all()
 
 
 def test_gemma4_sm90_d512_batch_softcap_fp16() -> None:
@@ -328,7 +369,7 @@ def test_gemma4_sm90_d512_block_sparse() -> None:
     torch.testing.assert_close(lse[0].float(), lse_ref, atol=3e-2, rtol=3e-2)
 
 
-def test_gemma4_sm90_d512_backward_fails_before_compilation() -> None:
+def test_gemma4_sm90_d512_deterministic_backward_is_rejected() -> None:
     _assert_sm90()
     q = torch.randn(8, 16, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(8, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -344,10 +385,25 @@ def test_gemma4_sm90_d512_backward_fails_before_compilation() -> None:
         max_seqlen_k=8,
         softmax_scale=1.0,
         causal=True,
+        deterministic=True,
     )
 
-    with pytest.raises(NotImplementedError, match="D512 backward"):
+    with pytest.raises(NotImplementedError, match="deterministic backward"):
         output.sum().backward()
+
+
+@pytest.mark.parametrize(("head_dim", "head_dim_v"), [(384, 384), (512, 256)])
+def test_sm90_backward_rejects_unvalidated_large_head_dims(head_dim: int, head_dim_v: int) -> None:
+    _assert_sm90()
+    q = torch.zeros(1, 8, 16, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(1, 8, 2, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros(1, 8, 2, head_dim_v, device="cuda", dtype=torch.bfloat16)
+    out = torch.zeros(1, 8, 16, head_dim_v, device="cuda", dtype=torch.bfloat16)
+    dout = torch.zeros_like(out)
+    lse = torch.zeros(1, 16, 8, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(NotImplementedError, match=r"up to 256 or exactly \(512, 512\)"):
+        _flash_attn_bwd(q, k, v, out, dout, lse, causal=True)
 
 
 def test_gemma4_sm90_rejects_unvalidated_intermediate_head_dim() -> None:

@@ -179,6 +179,11 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
     benchmarked on H100 SXM.
     """
+    if (head_dim > 256 or head_dim_v > 256) and (head_dim, head_dim_v) != (512, 512):
+        raise NotImplementedError(
+            "SM90 backward supports head dimensions up to 256 or exactly (512, 512); "
+            f"got ({head_dim}, {head_dim_v})"
+        )
     if head_dim <= 64:
         # C++ FA3: 128, 128, 64, ..., 2, 2, true, false, false, 2, 1, 2, 2
         return BwdConfig(
@@ -228,12 +233,20 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
                 num_wg=2,
             )
-    else:
-        # hdim 256
+    elif head_dim <= 256:
         return BwdConfig(
             m_block_size=64, n_block_size=64,
             num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
             SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+        )
+    else:
+        # Gemma 4 global attention. A narrow KV tile and transposed dKV MMA
+        # keep the D512 dK/dV accumulators within the Hopper register budget.
+        return BwdConfig(
+            m_block_size=64, n_block_size=16,
+            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
         )
 
@@ -1399,16 +1412,38 @@ def _flash_attn_bwd(
     alignment = 16 // q.element_size()
     if arch // 10 != 12:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
-    if arch // 10 == 9 and (head_dim > 256 or head_dim_v > 256):
-        raise NotImplementedError("SM90 D512 backward is not implemented")
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
+    is_sm90_gemma4_shape = arch // 10 == 9 and head_dim == 512 and head_dim_v == 512
+    if is_sm90_gemma4_shape:
+        unsupported = []
+        if not causal or local:
+            unsupported.append("non-causal or local attention")
+        if qhead_per_kvhead != 8:
+            unsupported.append(f"GQA ratio {qhead_per_kvhead} (expected 8)")
+        if deterministic:
+            unsupported.append("deterministic backward")
+        if softcap != 0.0 or score_mod is not None or score_mod_bwd is not None:
+            unsupported.append("softcap or score_mod")
+        if mask_mod is not None or block_sparse_tensors is not None:
+            unsupported.append("mask_mod or block sparsity")
+        if aux_tensors is not None:
+            unsupported.append("auxiliary tensors")
+        if dlse is not None:
+            unsupported.append("dLSE")
+        if seqused_q is not None or seqused_k is not None:
+            unsupported.append("seqused_q or seqused_k")
+        if unsupported:
+            raise NotImplementedError(
+                "SM90 D512 backward currently supports only Gemma 4 causal global attention "
+                "with GQA ratio 8; unsupported: " + ", ".join(unsupported)
+            )
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    
+
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
             "softcap and score_mod/score_mod_bwd cannot be used together"
