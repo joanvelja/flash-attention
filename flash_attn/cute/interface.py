@@ -171,6 +171,7 @@ class BwdConfig:
     AtomLayoutMdQ: int
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
+    dQ_accum_lane_contiguous: bool = False
 
 
 def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
@@ -241,13 +242,15 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
         )
     else:
-        # Gemma 4 global attention. A narrow KV tile and transposed dKV MMA
-        # keep the D512 dK/dV accumulators within the Hopper register budget.
+        # Gemma 4 global attention. Transposed dKV MMA keeps the D512 dK/dV
+        # accumulators within the Hopper register budget; N32 lets both warp
+        # groups partition score/dP into valid 16-column WGMMA tiles.
         return BwdConfig(
-            m_block_size=64, n_block_size=16,
+            m_block_size=64, n_block_size=32,
             num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
             SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            dQ_accum_lane_contiguous=True,
         )
 
 
@@ -1162,6 +1165,7 @@ _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
 
 def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+    dQ_accum_lane_contiguous,
     has_cuseqlens_q, has_seqused_q,
     use_2cta_instrs, cluster_size, arch,
 ):
@@ -1175,6 +1179,7 @@ def _compile_bwd_postprocess(
     mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     fa_bwd_post = FlashAttentionBackwardPostprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
+        dQ_accum_lane_contiguous=dQ_accum_lane_contiguous,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
     )
@@ -1190,11 +1195,12 @@ def _bwd_postprocess_convert(
     cu_seqlens, seqused,
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
-    use_2cta_instrs=False, cluster_size=1,
+    dQ_accum_lane_contiguous=False, use_2cta_instrs=False, cluster_size=1,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+        dQ_accum_lane_contiguous,
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
     )
@@ -1264,6 +1270,7 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+    dQ_accum_lane_contiguous = False
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
@@ -1310,6 +1317,7 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = cfg.AtomLayoutMdQ
         num_threads = (cfg.num_wg + 1) * 128
         dQ_single_wg = cfg.dQ_single_wg
+        dQ_accum_lane_contiguous = cfg.dQ_accum_lane_contiguous
         cluster_size = 1
         use_2cta_instrs = False
         is_varlen = (
@@ -1627,6 +1635,7 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs,
             dQ_single_wg,
+            dQ_accum_lane_contiguous,
             deterministic,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
@@ -1753,6 +1762,7 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
                 dQ_single_wg=dQ_single_wg,
+                dQ_accum_lane_contiguous=dQ_accum_lane_contiguous,
             )
         else:
             if use_dedicated_hd256_kernel:
@@ -1879,6 +1889,7 @@ def _flash_attn_bwd(
             cu_seqlens_q, seqused_q,
             arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
             AtomLayoutMdQ, dQ_swapAB,
+            dQ_accum_lane_contiguous=dQ_accum_lane_contiguous,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
         )
 

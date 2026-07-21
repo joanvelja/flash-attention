@@ -41,6 +41,7 @@ class FlashAttentionBackwardPostprocess:
         num_threads: int = 256,
         AtomLayoutMdQ: int = 1,
         dQ_swapAB: bool = False,
+        dQ_accum_lane_contiguous: bool = False,
         use_2cta_instrs: bool = False,
         cluster_size: int = 1,  # for varlen offsets
     ):
@@ -63,6 +64,11 @@ class FlashAttentionBackwardPostprocess:
         self.num_threads = num_threads
         self.AtomLayoutMdQ = AtomLayoutMdQ
         self.dQ_swapAB = dQ_swapAB
+        self.dQ_accum_lane_contiguous = dQ_accum_lane_contiguous
+        if self.dQ_accum_lane_contiguous:
+            assert arch // 10 == 9 and head_dim == 512
+            assert tile_m == 64 and num_threads == 256
+            assert AtomLayoutMdQ == 1 and not dQ_swapAB
         self.use_2cta_instrs = use_2cta_instrs and arch // 10 == 10 and head_dim != 64
         self.cluster_size = cluster_size
 
@@ -160,14 +166,29 @@ class FlashAttentionBackwardPostprocess:
         elif const_expr(self.arch // 10 == 9):
             num_threads_per_warp_group = 128
             num_wg_mma = self.num_threads // 128
-            self.s2r_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
-                cute.make_layout((num_threads_per_warp_group, num_wg_mma)),  # thr_layout
-                cute.make_layout(128 // Float32.width),  # val_layout
-            )
-            self.sdQaccum_layout = cute.make_layout(
-                (self.tile_m * self.tile_hdim // num_wg_mma, num_wg_mma)
-            )
+            if const_expr(self.dQ_accum_lane_contiguous):
+                assert self.tile_hdim == 512 and not self.dQ_swapAB
+                self.s2r_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
+                    cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=32
+                    ),
+                    cute.make_layout((self.num_threads, 1)),
+                    cute.make_layout((1, 128 // Float32.width)),
+                )
+                self.sdQaccum_layout = cute.make_layout(
+                    (self.num_threads, self.tile_m * self.tile_hdim // self.num_threads)
+                )
+            else:
+                self.s2r_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
+                    cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+                    ),
+                    cute.make_layout((num_threads_per_warp_group, num_wg_mma)),
+                    cute.make_layout(128 // Float32.width),
+                )
+                self.sdQaccum_layout = cute.make_layout(
+                    (self.tile_m * self.tile_hdim // num_wg_mma, num_wg_mma)
+                )
         else:
             self.dQ_reduce_ncol = 32
             dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
