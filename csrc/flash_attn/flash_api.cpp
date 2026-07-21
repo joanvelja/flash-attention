@@ -698,11 +698,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     params.page_block_size = page_block_size;
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
-    if (paged_KV || seqlenq_ngroups_swapped) {
+    if (seqlenq_ngroups_swapped) {
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
                                p_dropout, num_splits, get_num_sm(get_current_device()), opts);
+    } else if (paged_KV) {
+        TORCH_CHECK(num_splits <= 1, "num_splits > 1 is not supported for varlen paged KV");
+        params.num_splits = num_splits;
     }
 
     if (leftpad_k_.has_value()) {
@@ -1389,6 +1392,22 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_DEVICE(seqlens_k);
         CHECK_CONTIGUOUS(seqlens_k);
         CHECK_SHAPE(seqlens_k, batch_size);
+        // Defense-in-depth for the paged KV cache. The split-KV kernel indexes block_table with
+        // block_table[n_block * kBlockN / page_block_size], bounded only by actual_seqlen_k, which
+        // in this path is seqlens_k[b] + seqlen_knew (leftpad_k is disallowed with paged KV below).
+        // block_table only has max_num_blocks_per_seq entries per sequence, so if any sequence length
+        // exceeds max_num_blocks_per_seq * page_block_size the kernel reads block_table out of bounds.
+        // The kernel itself does no such check, so validate the caller contract here.
+        // Note: .max().item() forces a device->host sync, so we only pay it for the paged KV case.
+        if (paged_KV) {
+            const int seqlen_knew = k_.has_value() ? k.size(1) : 0;
+            const int max_seqlen_k = seqlens_k.max().item<int>() + seqlen_knew;
+            TORCH_CHECK(max_seqlen_k <= max_num_blocks_per_seq * page_block_size,
+                        "Paged KV cache: max(seqlens_k)", seqlen_knew > 0 ? " + seqlen_knew" : "", " (= ", max_seqlen_k,
+                        ") exceeds the capacity addressable by block_table (max_num_blocks_per_seq * page_block_size = ",
+                        max_num_blocks_per_seq * page_block_size, "). Allocate more columns in block_table, otherwise the "
+                        "kernel would index block_table out of bounds.");
+        }
         params.cu_seqlens_k = static_cast<int *>(seqlens_k.data_ptr());
     }
     params.is_seqlens_k_cumulative = !(seqlens_k_.has_value());

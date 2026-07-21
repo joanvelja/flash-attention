@@ -2523,3 +2523,124 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_paged_kv_num_splits(dtype):
+    """Passing num_splits=0 explicitly should be bitwise identical to not passing it (default)."""
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+
+    device = "cuda"
+    num_heads, num_heads_k, head_dim = 4, 2, 64
+    page_block_size = 256
+    scale = head_dim ** -0.5
+
+    batch_size = 2
+    kv_lens = [512, 1024]
+    max_seqlen_k = max(kv_lens)
+
+    max_blocks_per_seq = max(
+        (s + page_block_size - 1) // page_block_size for s in kv_lens
+    )
+    total_blocks = batch_size * max_blocks_per_seq
+    k_cache = torch.randn(
+        total_blocks, page_block_size, num_heads_k, head_dim,
+        device=device, dtype=dtype,
+    )
+    v_cache = torch.randn(
+        total_blocks, page_block_size, num_heads_k, head_dim,
+        device=device, dtype=dtype,
+    )
+
+    block_table = rearrange(
+        torch.randperm(total_blocks, dtype=torch.int32, device=device),
+        "(b nblocks) -> b nblocks",
+        b=batch_size,
+    )
+
+    q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.nn.functional.pad(seqused_k.cumsum(0), (1, 0)).to(torch.int32)
+
+    fwd_kwargs = dict(
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=1, max_seqlen_k=max_seqlen_k,
+        dropout_p=0.0, softmax_scale=scale,
+        causal=False, window_size_left=-1, window_size_right=0,
+        block_table=block_table, seqused_k=seqused_k,
+    )
+
+    out_default = _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs)[0]
+    out_explicit = _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=0)[0]
+
+    assert not out_default.isnan().any(), "default num_splits produced NaN"
+    assert torch.equal(out_default, out_explicit), (
+        f"default vs num_splits=0 differ: max diff {(out_default - out_explicit).abs().max().item()}"
+    )
+
+    with pytest.raises(RuntimeError, match="num_splits > 1 is not supported"):
+        _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("paged_kv_block_size", [256])
+@pytest.mark.parametrize("append_knew", [False, True])
+def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block_size, dtype):
+    # Regression test for the paged-KV out-of-bounds guard (issue #2709).
+    # block_table only has `max_num_blocks_per_seq` columns, so the split-KV kernel can
+    # only safely index it up to max_num_blocks_per_seq * page_block_size tokens. If any
+    # cache_seqlens[b] (+ appended new keys) exceeds that capacity, mha_fwd_kvcache must
+    # raise instead of letting the kernel read block_table out of bounds.
+    device = "cuda"
+    batch_size = 1
+    nheads = 1
+    d = 64
+    max_num_blocks_per_seq = 1
+    capacity = max_num_blocks_per_seq * paged_kv_block_size
+
+    # A pool of pages large enough that the block_table indices are always valid;
+    # the guard must fire on the sequence length, not on missing pages.
+    num_blocks = 4
+    k_cache_paged = torch.randn(num_blocks, paged_kv_block_size, nheads, d, device=device, dtype=dtype)
+    v_cache_paged = torch.randn(num_blocks, paged_kv_block_size, nheads, d, device=device, dtype=dtype)
+    block_table = torch.zeros(batch_size, max_num_blocks_per_seq, dtype=torch.int32, device=device)
+
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+
+    if append_knew:
+        # cache is full at capacity, appending even one new key overflows the block_table.
+        seqlen_knew = 1
+        k_new = torch.randn(batch_size, seqlen_knew, nheads, d, device=device, dtype=dtype)
+        v_new = torch.randn(batch_size, seqlen_knew, nheads, d, device=device, dtype=dtype)
+        cache_seqlens = torch.full((batch_size,), capacity, dtype=torch.int32, device=device)
+    else:
+        seqlen_knew = 0
+        k_new = None
+        v_new = None
+        cache_seqlens = torch.full((batch_size,), capacity + 1, dtype=torch.int32, device=device)
+
+    with pytest.raises(RuntimeError, match="block_table"):
+        flash_attn_with_kvcache(
+            q,
+            k_cache_paged,
+            v_cache_paged,
+            k=k_new,
+            v=v_new,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            causal=False,
+        )
+
+    # Positive control: exactly at capacity (and no appended keys) must NOT raise.
+    cache_seqlens_ok = torch.full((batch_size,), capacity, dtype=torch.int32, device=device)
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        cache_seqlens=cache_seqlens_ok,
+        block_table=block_table,
+        causal=False,
+    )
+    assert out.shape == (batch_size, 1, nheads, d)
+    assert not out.isnan().any()
