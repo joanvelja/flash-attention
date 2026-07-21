@@ -94,10 +94,10 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
     is_sm90_legacy_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
-    is_sm90_gemma4_shape = head_dim == 512 and head_dim_v == 512
+    is_sm90_d512_shape = head_dim == 512 and head_dim_v == 512
     if compute_capability == 9:
         assert (
-            (is_sm90_legacy_range or is_sm90_gemma4_shape)
+            (is_sm90_legacy_range or is_sm90_d512_shape)
             and head_dim % alignment == 0
             and head_dim_v % alignment == 0
         ), (
@@ -153,7 +153,7 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
     elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
-    else:  # Gemma 4 hdim 512
+    else:  # SM90 D512
         return FwdConfig(64, 64, False, True)
 
 @dataclass(frozen=True)
@@ -242,7 +242,7 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
         )
     else:
-        # Gemma 4 global attention. Transposed dKV MMA keeps the D512 dK/dV
+        # Transposed dKV MMA keeps the D512 dK/dV
         # accumulators within the Hopper register budget; N32 lets both warp
         # groups partition score/dP into valid 16-column WGMMA tiles.
         return BwdConfig(
@@ -445,14 +445,14 @@ def _flash_attn_fwd(
     alignment = 16 // q.element_size()
     if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
-    is_sm90_gemma4_shape = arch // 10 == 9 and head_dim == 512 and head_dim_v == 512
-    if is_sm90_gemma4_shape and page_table is not None:
+    is_sm90_d512_shape = arch // 10 == 9 and head_dim == 512 and head_dim_v == 512
+    if is_sm90_d512_shape and page_table is not None:
         raise NotImplementedError("SM90 D512 paged KV is not implemented")
     if num_splits < 1 and arch // 10 in [8, 9]:
         # SM80/SM90 forward has no SplitKV kernel, so auto resolves to the only
         # supported value instead of reaching the unsupported split dispatch.
         num_splits = 1
-    if is_sm90_gemma4_shape and num_splits > 1:
+    if is_sm90_d512_shape and num_splits > 1:
         raise NotImplementedError("SM90 D512 SplitKV is not implemented; num_splits must be 1 (or 0 = auto)")
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim) if qv is None else 1.0 / math.sqrt(head_dim + head_dim_v)
@@ -1423,8 +1423,8 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
-    is_sm90_gemma4_shape = arch // 10 == 9 and head_dim == 512 and head_dim_v == 512
-    if is_sm90_gemma4_shape:
+    is_sm90_d512_shape = arch // 10 == 9 and head_dim == 512 and head_dim_v == 512
+    if is_sm90_d512_shape:
         unsupported = []
         if not causal or local:
             unsupported.append("non-causal or local attention")
@@ -1444,8 +1444,8 @@ def _flash_attn_bwd(
             unsupported.append("seqused_q or seqused_k")
         if unsupported:
             raise NotImplementedError(
-                "SM90 D512 backward currently supports only Gemma 4 causal global attention "
-                "with GQA ratio 8; unsupported: " + ", ".join(unsupported)
+                "SM90 D512 backward currently supports only causal global attention with "
+                "GQA ratio 8; unsupported: " + ", ".join(unsupported)
             )
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
