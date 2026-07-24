@@ -114,6 +114,9 @@ class FlashAttentionBackwardSm90:
             assert (head_dim, head_dim_v) == (512, 512)
             assert qhead_per_kvhead in (4, 8, 16)
             assert is_causal and not is_local and not deterministic
+            assert score_mod is None and score_mod_bwd is None and mask_mod is None
+            assert not has_aux_tensors
+            assert not V_in_regs
         if self.dq_owner:
             assert not dQ_single_wg and not dQ_swapAB and not SdP_swapAB
             assert (tile_m, tile_n) == (64, 32)
@@ -428,6 +431,12 @@ class FlashAttentionBackwardSm90:
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        if const_expr(not self.fused_dq):
+            assert mSeqUsedQ is None and mSeqUsedK is None
+            assert window_size_left is None and window_size_right is None
+            assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None
+            assert aux_tensors is None
+            assert blocksparse_tensors is None
         # For GQA (qhead_per_kvhead > 1), multiple Q heads accumulate into the same dK/dV,
         # so we need the float32 accum path + postprocess.
         # For varlen_k with qhead_per_kvhead == 1, we use ragged TMA tensors.
@@ -2407,3 +2416,93 @@ class FlashAttentionBackwardSm90:
 
         if const_expr(not self.deterministic):
             cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+
+class FlashAttentionBackwardSm90Split:
+    """One cacheable CuTe callable for the SM90 D512 dQ and dKV kernels."""
+
+    def __init__(
+        self,
+        dq_kernel: FlashAttentionBackwardSm90,
+        dkv_kernel: FlashAttentionBackwardSm90,
+    ):
+        assert dq_kernel.dq_owner and not dq_kernel.compute_dkv
+        assert not dkv_kernel.dq_owner and not dkv_kernel.fused_dq
+        assert dkv_kernel.compute_dkv
+        self.dq_kernel = dq_kernel
+        self.dkv_kernel = dkv_kernel
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mLSE: cute.Tensor,
+        mdPsum: cute.Tensor,
+        mdQaccum: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+        softmax_scale: Float32,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
+        mdQ_semaphore: Optional[cute.Tensor] = None,
+        mdK_semaphore: Optional[cute.Tensor] = None,
+        mdV_semaphore: Optional[cute.Tensor] = None,
+        aux_tensors: Optional[list] = None,
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        stream: cuda.CUstream = None,
+    ):
+        self.dq_kernel(
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mLSE,
+            mdPsum,
+            mdQaccum,
+            mdK,
+            mdV,
+            softmax_scale,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
+            window_size_left,
+            window_size_right,
+            mdQ_semaphore,
+            mdK_semaphore,
+            mdV_semaphore,
+            aux_tensors,
+            blocksparse_tensors,
+            stream,
+        )
+        self.dkv_kernel(
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mLSE,
+            mdPsum,
+            mdQaccum,
+            mdK,
+            mdV,
+            softmax_scale,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
+            window_size_left,
+            window_size_right,
+            mdQ_semaphore,
+            mdK_semaphore,
+            mdV_semaphore,
+            aux_tensors,
+            blocksparse_tensors,
+            stream,
+        )
