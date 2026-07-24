@@ -442,7 +442,8 @@ class FlashAttentionBackwardSm90:
             assert mSeqUsedQ is None and mSeqUsedK is None
             assert window_size_left is None and window_size_right is None
             assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None
-            assert aux_tensors is None
+            assert aux_data.tensors is None or len(aux_data.tensors) == 0
+            assert aux_data.scalars is None or len(aux_data.scalars) == 0
             assert blocksparse_tensors is None
         # For GQA (qhead_per_kvhead > 1), multiple Q heads accumulate into the same dK/dV,
         # so we need the float32 accum path + postprocess.
@@ -1800,7 +1801,7 @@ class FlashAttentionBackwardSm90:
         dQaccum_thr_copy: cute.TiledCopy,
         softmax_scale_log2: Float32,
         PdS_barrier: cutlass.pipeline.NamedBarrier,
-        thr_mma_SdP: cute.core.ThrMma,
+        thr_mma_SdP: cute.ThrMma,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
@@ -1830,7 +1831,7 @@ class FlashAttentionBackwardSm90:
                     mask_causal=self.is_causal,
                     mask_local=self.is_local,
                     mask_mod=self.mask_mod,
-                    aux_tensors=None,
+                    aux_data=AuxData(),
                     fastdiv_mods=(None, None),
                 )
                 for n_block in cutlass.range(n_block_min, n_block_max, unroll=1):
@@ -2500,7 +2501,7 @@ class FlashAttentionBackwardSm90Split:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         stream: cuda.CUstream = None,
     ):
@@ -2524,7 +2525,7 @@ class FlashAttentionBackwardSm90Split:
             mdQ_semaphore,
             mdK_semaphore,
             mdV_semaphore,
-            aux_tensors,
+            aux_data,
             blocksparse_tensors,
             stream,
         )
@@ -2548,7 +2549,7 @@ class FlashAttentionBackwardSm90Split:
             mdQ_semaphore,
             mdK_semaphore,
             mdV_semaphore,
-            aux_tensors,
+            aux_data,
             blocksparse_tensors,
             stream,
         )
