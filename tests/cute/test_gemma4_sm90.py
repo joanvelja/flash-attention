@@ -182,12 +182,20 @@ def test_gemma4_sm90_varlen_canary(
             assert torch.isfinite(actual).all()
 
 
-def test_gemma4_sm90_d512_fp16_batch_backward() -> None:
+@pytest.mark.parametrize(
+    ("query_heads", "key_value_heads"),
+    [(8, 2), (16, 2), (16, 1)],
+    ids=("gqa4", "gqa8", "gqa16"),
+)
+def test_gemma4_sm90_d512_fp16_batch_backward(
+    query_heads: int,
+    key_value_heads: int,
+) -> None:
     _assert_sm90()
-    torch.manual_seed(2512)
+    torch.manual_seed(2512 + query_heads + key_value_heads)
     query_length, key_length = 129, 257
-    q = torch.randn(1, query_length, 16, 512, device="cuda", dtype=torch.float16, requires_grad=True)
-    k = torch.randn(1, key_length, 2, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+    q = torch.randn(1, query_length, query_heads, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(1, key_length, key_value_heads, 512, device="cuda", dtype=torch.float16, requires_grad=True)
     v = torch.randn_like(k, requires_grad=True)
     q_ref = q.detach().clone().requires_grad_()
     k_ref = k.detach().clone().requires_grad_()
