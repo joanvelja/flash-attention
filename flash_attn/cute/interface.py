@@ -40,7 +40,10 @@ from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleT
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+from flash_attn.cute.flash_bwd_sm90 import (
+    FlashAttentionBackwardSm90,
+    FlashAttentionBackwardSm90Split,
+)
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
@@ -1961,13 +1964,15 @@ def _flash_attn_bwd(
                 "dQ_accum_lane_contiguous": dQ_accum_lane_contiguous,
             }
             fa_bwd_obj = (
-                tuple(
-                    FlashAttentionBackwardSm90(
-                        *sm90_args,
-                        **sm90_kwargs,
-                        split_mode=split_mode,
+                FlashAttentionBackwardSm90Split(
+                    *(
+                        FlashAttentionBackwardSm90(
+                            *sm90_args,
+                            **sm90_kwargs,
+                            split_mode=split_mode,
+                        )
+                        for split_mode in ("dq", "dkv")
                     )
-                    for split_mode in ("dq", "dkv")
                 )
                 if use_sm90_d512_split
                 else FlashAttentionBackwardSm90(*sm90_args, **sm90_kwargs)
@@ -2056,21 +2061,11 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
             current_stream,
         )
-        if use_sm90_d512_split:
-            _flash_attn_bwd.compile_cache[compile_key] = tuple(
-                cute.compile(
-                    split_obj,
-                    *compile_args,
-                    options="--enable-tvm-ffi",
-                )
-                for split_obj in fa_bwd_obj
-            )
-        else:
-            _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-                fa_bwd_obj,
-                *compile_args,
-                options="--enable-tvm-ffi",
-            )
+        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+            fa_bwd_obj,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
         runtime_args = (
@@ -2108,11 +2103,7 @@ def _flash_attn_bwd(
             else None,
         )
         compiled_bwd = _flash_attn_bwd.compile_cache[compile_key]
-        if use_sm90_d512_split:
-            for split_kernel in compiled_bwd:
-                split_kernel(*runtime_args)
-        else:
-            compiled_bwd(*runtime_args)
+        compiled_bwd(*runtime_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:
