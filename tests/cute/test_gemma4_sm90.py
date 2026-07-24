@@ -182,12 +182,20 @@ def test_gemma4_sm90_varlen_canary(
             assert torch.isfinite(actual).all()
 
 
-def test_gemma4_sm90_d512_fp16_batch_backward() -> None:
+@pytest.mark.parametrize(
+    ("query_heads", "key_value_heads"),
+    [(8, 2), (16, 2), (16, 1)],
+    ids=("gqa4", "gqa8", "gqa16"),
+)
+def test_gemma4_sm90_d512_fp16_batch_backward(
+    query_heads: int,
+    key_value_heads: int,
+) -> None:
     _assert_sm90()
-    torch.manual_seed(2512)
+    torch.manual_seed(2512 + query_heads + key_value_heads)
     query_length, key_length = 129, 257
-    q = torch.randn(1, query_length, 16, 512, device="cuda", dtype=torch.float16, requires_grad=True)
-    k = torch.randn(1, key_length, 2, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+    q = torch.randn(1, query_length, query_heads, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(1, key_length, key_value_heads, 512, device="cuda", dtype=torch.float16, requires_grad=True)
     v = torch.randn_like(k, requires_grad=True)
     q_ref = q.detach().clone().requires_grad_()
     k_ref = k.detach().clone().requires_grad_()
@@ -300,7 +308,7 @@ def test_gemma4_sm90_d512_mask_mod() -> None:
     q = torch.randn(2, sequence_q, 4, 512, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(2, sequence_k, 4, 512, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    output, lse = _flash_attn_fwd(
+    output, lse, *_ = _flash_attn_fwd(
         q=q,
         k=k,
         v=v,
@@ -334,7 +342,7 @@ def test_gemma4_sm90_d512_block_sparse() -> None:
     q = torch.randn(batch, sequence_q, heads, 512, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(batch, sequence_k, heads, 512, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    _, sparse_tensors = compute_block_sparsity(
+    sparse_tensors = compute_block_sparsity(
         tile_m=64,
         tile_n=64,
         batch_size=batch,
@@ -353,7 +361,7 @@ def test_gemma4_sm90_d512_block_sparse() -> None:
         full_block_idx=full_index,
         block_size=(64, 64),
     )
-    output, lse = _flash_attn_fwd(
+    output, lse, *_ = _flash_attn_fwd(
         q=q,
         k=k,
         v=v,
