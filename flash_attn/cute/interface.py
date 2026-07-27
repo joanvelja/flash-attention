@@ -10,6 +10,8 @@ from typing import Optional, Tuple, Callable
 import torch
 
 
+FLASH_ATTN_CUTE_RING_ABI = 1
+
 
 import cutlass
 import cutlass.cute as cute
