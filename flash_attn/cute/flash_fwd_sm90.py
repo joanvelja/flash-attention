@@ -69,6 +69,38 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.cluster_shape_mn = (1, 1)
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
 
+    def _supports_cta_score_publication(
+        self,
+        blocksparse_tensors,
+        learnable_sink,
+        aux_data,
+        mPageTable,
+        mSeqUsedQ,
+        mSeqUsedK,
+    ) -> bool:
+        return (
+            self.dtype == cutlass.BFloat16
+            and self.tile_hdim == 512
+            and self.tile_hdimv == 512
+            and self.tile_m == 64
+            and self.tile_n == 64
+            and self.num_wg_mma == 2
+            and self.is_causal
+            and not self.is_local
+            and self.qhead_per_kvhead in (4, 8)
+            and not self.mma_pv_is_rs
+            and self.intra_wg_overlap
+            and self.score_mod is None
+            and self.mask_mod is None
+            and blocksparse_tensors is None
+            and learnable_sink is None
+            and aux_data.tensors is None
+            and aux_data.scalars is None
+            and mPageTable is None
+            and mSeqUsedQ is None
+            and mSeqUsedK is None
+        )
+
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
             sm90_utils_basic.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, self.dtype, self.tile_hdim),
@@ -238,28 +270,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
-        # Keep GQA16 on the generic path: its score-publication compile is pathologically slow.
-        self.cta_score_publication = (
-            self.dtype == cutlass.BFloat16
-            and self.tile_hdim == 512
-            and self.tile_hdimv == 512
-            and self.tile_m == 64
-            and self.tile_n == 64
-            and self.num_wg_mma == 2
-            and self.is_causal
-            and not self.is_local
-            and self.qhead_per_kvhead in (4, 8)
-            and not self.mma_pv_is_rs
-            and self.intra_wg_overlap
-            and self.score_mod is None
-            and self.mask_mod is None
-            and blocksparse_tensors is None
-            and learnable_sink is None
-            and aux_data.tensors is None
-            and aux_data.scalars is None
-            and mPageTable is None
-            and mSeqUsedQ is None
-            and mSeqUsedK is None
+        # Score publication is limited to preregistered production GQA4/8; GQA16 stays generic.
+        self.cta_score_publication = self._supports_cta_score_publication(
+            blocksparse_tensors,
+            learnable_sink,
+            aux_data,
+            mPageTable,
+            mSeqUsedQ,
+            mSeqUsedK,
         )
         if const_expr(self.cta_score_publication):
             assert self.rescale_O_before_gemm
