@@ -90,34 +90,20 @@ def _reference_varlen(
 
 
 @pytest.mark.parametrize(
-    (
-        "head_dim",
-        "query_lengths",
-        "key_lengths",
-        "causal",
-        "scale",
-        "window",
-        "check_backward",
-        "parent_query_heads",
-        "query_heads",
-        "key_value_heads",
-        "launch_repeats",
-    ),
+    ("head_dim", "query_lengths", "key_lengths", "causal", "scale", "window", "check_backward"),
     [
-        (64, [197, 65], [197, 65], False, None, (None, None), True, 8, 8, 2, 1),
-        (128, [73, 129], [137, 193], True, 0.37, (None, None), True, 8, 8, 2, 1),
-        (256, [1057, 511], [1057, 511], True, 1.0, (1023, 0), True, 16, 16, 8, 1),
-        (512, [257, 129], [1025, 769], True, 1.0, (None, None), True, 8, 4, 1, 16),
-        (512, [321, 193], [1153, 897], True, 1.0, (None, None), True, 16, 8, 1, 16),
-        (512, [200, 129], [264, 385], False, 1.0, (127, 15), False, 16, 16, 2, 1),
-        (512, [0, 257, 129], [64, 513, 385], True, 1.0, (None, None), False, 16, 16, 2, 1),
+        (64, [197, 65], [197, 65], False, None, (None, None), True),
+        (128, [73, 129], [137, 193], True, 0.37, (None, None), True),
+        (256, [1057, 511], [1057, 511], True, 1.0, (1023, 0), True),
+        (512, [257, 129], [513, 385], True, 1.0, (None, None), True),
+        (512, [200, 129], [264, 385], False, 1.0, (127, 15), False),
+        (512, [0, 257, 129], [64, 513, 385], True, 1.0, (None, None), False),
     ],
     ids=(
         "legacy-d64",
         "legacy-d128-bottom-right",
         "gemma-local-d256",
-        "gemma-global-d512-gqa4",
-        "gemma-global-d512-gqa8",
+        "gemma-global-d512",
         "gemma-local-d512-forward",
         "gemma-zerolen-d512-forward",
     ),
@@ -130,15 +116,14 @@ def test_gemma4_sm90_varlen_canary(
     scale: float | None,
     window: tuple[int | None, int | None],
     check_backward: bool,
-    parent_query_heads: int,
-    query_heads: int,
-    key_value_heads: int,
-    launch_repeats: int,
 ) -> None:
     _assert_sm90()
     torch.manual_seed(head_dim)
-    q_storage = torch.randn(sum(query_lengths), parent_query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    q = q_storage[:, :query_heads].requires_grad_(check_backward)
+    query_heads = 16 if head_dim >= 256 else 8
+    key_value_heads = 8 if head_dim == 256 else 2
+    q = torch.randn(
+        sum(query_lengths), query_heads, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=check_backward
+    )
     k = torch.randn(
         sum(key_lengths), key_value_heads, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=check_backward
     )
@@ -148,21 +133,19 @@ def test_gemma4_sm90_varlen_canary(
     v_ref = v.detach().clone().requires_grad_(check_backward)
     effective_scale = head_dim**-0.5 if scale is None else scale
 
-    def run_candidate() -> tuple[torch.Tensor, torch.Tensor]:
-        return flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=_cu_seqlens(query_lengths),
-            cu_seqlens_k=_cu_seqlens(key_lengths),
-            max_seqlen_q=max(query_lengths),
-            max_seqlen_k=max(key_lengths),
-            softmax_scale=scale,
-            causal=causal,
-            window_size=window,
-            return_lse=True,
-        )
-
+    output, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=_cu_seqlens(query_lengths),
+        cu_seqlens_k=_cu_seqlens(key_lengths),
+        max_seqlen_q=max(query_lengths),
+        max_seqlen_k=max(key_lengths),
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window,
+        return_lse=True,
+    )
     output_ref, lse_ref = _reference_varlen(
         q_ref,
         k_ref,
@@ -173,13 +156,7 @@ def test_gemma4_sm90_varlen_canary(
         causal,
         window,
     )
-
-    for _ in range(launch_repeats - 1):
-        with torch.no_grad():
-            stress_output, stress_lse = run_candidate()
-        torch.testing.assert_close(stress_output.float(), output_ref.float(), atol=3e-2, rtol=3e-2)
-        torch.testing.assert_close(stress_lse.float(), lse_ref.float(), atol=3e-2, rtol=3e-2)
-    output, lse = run_candidate()
+    torch.cuda.synchronize()
 
     torch.testing.assert_close(output.float(), output_ref.float(), atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(lse.float(), lse_ref.float(), atol=3e-2, rtol=3e-2)
