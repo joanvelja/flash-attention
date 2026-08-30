@@ -1046,11 +1046,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             (warp_group_idx % num_wg_mma_qk) * self.num_threads_per_warp_group
         )
         wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
-        _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
+        acc_S, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
             wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
         )
         mma_qk_fn = partial(
-            sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
+            sm90_utils.gemm_w_idx,
+            tiled_mma_qk,
+            acc_S,
+            tSrQ,
+            tSrK,
+            zero_init=True,
         )
         acc_O, tOrP, tOrVt = sm90_utils.partition_fragment_ABC(
             wg_mma_pv, (self.tile_m, self.tile_hdimv, self.tile_n), sP, sVt
@@ -1094,6 +1099,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mma_qk_fn=mma_qk_fn,
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
+            acc_S=acc_S,
             acc_O=acc_O,
             tOrP=tOrP,
             smem_copy_params=smem_copy_params,
@@ -1108,6 +1114,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.first_half_block_overlap,
             mma_qk_fn=mma_qk_fn,
             pipeline_k=pipeline_k,
+            acc_S=acc_S,
             tOrP=tOrP,
             smem_copy_params=smem_copy_params,
             score_stats=score_stats,
@@ -1366,6 +1373,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_qk_fn: Callable,
         kv_consumer_state,
         pipeline_k,
+        acc_S: cute.Tensor,
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
         score_stats: Optional[cute.Tensor],
@@ -1384,7 +1392,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
         if const_expr(self.cta_score_publication):
             if is_score_owner:
-                acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+                mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
                 mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
                 row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
                 scores_scale.store(row_scale.load())
@@ -1396,7 +1404,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.publish_score_stats(scores_scale, score_stats, qk_tidx)
             pipeline_k.consumer_release(kv_consumer_state)
         else:
-            acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+            mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
             pipeline_k.consumer_release(kv_consumer_state)
 
             # Apply score modification if present
@@ -1471,6 +1479,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_pv_fn: Callable,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
+        acc_S: cute.Tensor,
         acc_O: cute.Tensor,
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
@@ -1487,7 +1496,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         # S = Q @ K.T
-        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
         pipeline_k.consumer_release(smem_pipe_read)
@@ -1536,6 +1545,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_pv_fn: Callable,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
+        acc_S: cute.Tensor,
         acc_O: cute.Tensor,
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
@@ -1556,9 +1566,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # S = Q @ K.T
         if const_expr(self.cta_score_publication):
             if is_score_owner:
-                acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+                mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         else:
-            acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+            mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         # RescaleOBeforeGemm: rescale O while QK GEMM is in flight, before PV GEMM
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
