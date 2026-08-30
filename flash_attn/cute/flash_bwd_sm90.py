@@ -184,9 +184,7 @@ class FlashAttentionBackwardSm90:
         assert self.tile_n % score_n_wg == 0
         assert self.tile_m % self.AtomLayoutMSdP == 0
         score_wgmma_n = (
-            self.tile_m // self.AtomLayoutMSdP
-            if self.SdP_swapAB
-            else self.tile_n // score_n_wg
+            self.tile_m // self.AtomLayoutMSdP if self.SdP_swapAB else self.tile_n // score_n_wg
         )
         assert score_wgmma_n % 16 == 0
 
@@ -2118,9 +2116,7 @@ class FlashAttentionBackwardSm90:
                 )
                 assert cute.size(acc_dQ_atomic) == cute.size(tdQgdQaccum_cur)
                 for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
-                    utils.atomic_add_fp32(
-                        acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_cur, i)
-                    )
+                    utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_cur, i))
             else:
                 # dQ R2S: wait for dQaccum_store to free the smem buffer, then write dQ to smem
                 # When dQ_single_wg, only WG0 enters here so warp_group_idx == 0
