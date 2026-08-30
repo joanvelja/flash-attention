@@ -1434,6 +1434,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
+        if const_expr(self.cta_score_publication):
+            # Protect sP reuse by the next persistent work tile.
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PEmpty),
+                number_of_threads=self.num_mma_threads,
+            )
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
         return kv_consumer_state
@@ -1562,6 +1568,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
             row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
         warpgroup.wait_group(0)
+        if const_expr(self.cta_score_publication):
+            # Both warp groups must finish reading single-buffered sP before its next write.
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PEmpty),
+                number_of_threads=self.num_mma_threads,
+            )
         pipeline_v.consumer_release(smem_pipe_read_v)
         if const_expr(self.cta_score_publication):
             if is_score_owner:

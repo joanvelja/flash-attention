@@ -101,15 +101,16 @@ def _reference_varlen(
         "parent_query_heads",
         "query_heads",
         "key_value_heads",
+        "launch_repeats",
     ),
     [
-        (64, [197, 65], [197, 65], False, None, (None, None), True, 8, 8, 2),
-        (128, [73, 129], [137, 193], True, 0.37, (None, None), True, 8, 8, 2),
-        (256, [1057, 511], [1057, 511], True, 1.0, (1023, 0), True, 16, 16, 8),
-        (512, [193, 65], [257, 129], True, 1.0, (None, None), True, 8, 4, 1),
-        (512, [257, 129], [513, 385], True, 1.0, (None, None), True, 16, 8, 1),
-        (512, [200, 129], [264, 385], False, 1.0, (127, 15), False, 16, 16, 2),
-        (512, [0, 257, 129], [64, 513, 385], True, 1.0, (None, None), False, 16, 16, 2),
+        (64, [197, 65], [197, 65], False, None, (None, None), True, 8, 8, 2, 1),
+        (128, [73, 129], [137, 193], True, 0.37, (None, None), True, 8, 8, 2, 1),
+        (256, [1057, 511], [1057, 511], True, 1.0, (1023, 0), True, 16, 16, 8, 1),
+        (512, [257, 129], [1025, 769], True, 1.0, (None, None), True, 8, 4, 1, 16),
+        (512, [321, 193], [1153, 897], True, 1.0, (None, None), True, 16, 8, 1, 16),
+        (512, [200, 129], [264, 385], False, 1.0, (127, 15), False, 16, 16, 2, 1),
+        (512, [0, 257, 129], [64, 513, 385], True, 1.0, (None, None), False, 16, 16, 2, 1),
     ],
     ids=(
         "legacy-d64",
@@ -132,6 +133,7 @@ def test_gemma4_sm90_varlen_canary(
     parent_query_heads: int,
     query_heads: int,
     key_value_heads: int,
+    launch_repeats: int,
 ) -> None:
     _assert_sm90()
     torch.manual_seed(head_dim)
@@ -146,19 +148,21 @@ def test_gemma4_sm90_varlen_canary(
     v_ref = v.detach().clone().requires_grad_(check_backward)
     effective_scale = head_dim**-0.5 if scale is None else scale
 
-    output, lse = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q=_cu_seqlens(query_lengths),
-        cu_seqlens_k=_cu_seqlens(key_lengths),
-        max_seqlen_q=max(query_lengths),
-        max_seqlen_k=max(key_lengths),
-        softmax_scale=scale,
-        causal=causal,
-        window_size=window,
-        return_lse=True,
-    )
+    def run_candidate() -> tuple[torch.Tensor, torch.Tensor]:
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=_cu_seqlens(query_lengths),
+            cu_seqlens_k=_cu_seqlens(key_lengths),
+            max_seqlen_q=max(query_lengths),
+            max_seqlen_k=max(key_lengths),
+            softmax_scale=scale,
+            causal=causal,
+            window_size=window,
+            return_lse=True,
+        )
+
     output_ref, lse_ref = _reference_varlen(
         q_ref,
         k_ref,
@@ -169,7 +173,13 @@ def test_gemma4_sm90_varlen_canary(
         causal,
         window,
     )
-    torch.cuda.synchronize()
+
+    for _ in range(launch_repeats - 1):
+        with torch.no_grad():
+            stress_output, stress_lse = run_candidate()
+        torch.testing.assert_close(stress_output.float(), output_ref.float(), atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(stress_lse.float(), lse_ref.float(), atol=3e-2, rtol=3e-2)
+    output, lse = run_candidate()
 
     torch.testing.assert_close(output.float(), output_ref.float(), atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(lse.float(), lse_ref.float(), atol=3e-2, rtol=3e-2)
