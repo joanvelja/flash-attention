@@ -69,6 +69,38 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.cluster_shape_mn = (1, 1)
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
 
+    def _supports_cta_score_publication(
+        self,
+        blocksparse_tensors,
+        learnable_sink,
+        aux_data,
+        mPageTable,
+        mSeqUsedQ,
+        mSeqUsedK,
+    ) -> bool:
+        return (
+            self.dtype == cutlass.BFloat16
+            and self.tile_hdim == 512
+            and self.tile_hdimv == 512
+            and self.tile_m == 64
+            and self.tile_n == 64
+            and self.num_wg_mma == 2
+            and self.is_causal
+            and not self.is_local
+            and self.qhead_per_kvhead in (4, 8)
+            and not self.mma_pv_is_rs
+            and self.intra_wg_overlap
+            and self.score_mod is None
+            and self.mask_mod is None
+            and blocksparse_tensors is None
+            and learnable_sink is None
+            and aux_data.tensors is None
+            and aux_data.scalars is None
+            and mPageTable is None
+            and mSeqUsedQ is None
+            and mSeqUsedK is None
+        )
+
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
             sm90_utils_basic.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, self.dtype, self.tile_hdim),
@@ -132,6 +164,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
         sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
+        score_stats_size = self.tile_m * 4 * 2 if const_expr(self.cta_score_publication) else 0
+        score_stats_struct = cute.struct.Align[cute.struct.MemRange[Float32, score_stats_size], 128]
         # 1 stage * 2 for Q pipeline (full + empty), self.num_stages*2 for K, self.num_stages*2 for V,
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
@@ -146,6 +180,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sQ: sQ_struct
             sK: sK_struct
             sP: sP_struct
+            score_stats: score_stats_struct
 
         @cute.struct
         class SharedStorageSharedQV:
@@ -155,6 +190,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sQ: sQV_struct
             sK: sK_struct
             sP: sP_struct
+            score_stats: score_stats_struct
 
         return SharedStorageQKV if const_expr(not self.Q_in_regs) else SharedStorageSharedQV
 
@@ -234,6 +270,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
+        # Score publication is limited to preregistered production GQA4/8; GQA16 stays generic.
+        self.cta_score_publication = self._supports_cta_score_publication(
+            blocksparse_tensors,
+            learnable_sink,
+            aux_data,
+            mPageTable,
+            mSeqUsedQ,
+            mSeqUsedK,
+        )
+        if const_expr(self.cta_score_publication):
+            assert self.rescale_O_before_gemm
+            assert self.num_threads_per_warp_group == 128
+            assert self.tile_m * 4 % self.num_threads_per_warp_group == 0
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
@@ -535,6 +584,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
+        score_stats = None
+        if const_expr(self.cta_score_publication):
+            score_stats_layout = cute.make_layout(
+                (
+                    self.num_threads_per_warp_group,
+                    self.tile_m * 4 // self.num_threads_per_warp_group,
+                    2,
+                )
+            )
+            score_stats = storage.score_stats.get_tensor(score_stats_layout)
         # reuse sQ's data iterator
         sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
 
@@ -605,13 +664,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
 
         else:  # Consumer
-            cute.arch.setmaxregister_increase(self.num_mma_regs)
             # ///////////////////////////////////////////////////////////////////////////////
             # Tile MMA compute thread partitions and allocate accumulators
             # ///////////////////////////////////////////////////////////////////////////////
             tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
-            self.mma(
+            mma_args = (
                 tiled_mma_qk,
                 tiled_mma_pv,
                 mO,
@@ -620,6 +678,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sK,
                 sVt,
                 sP,
+                score_stats,
                 sO,
                 learnable_sink,
                 pipeline_k,
@@ -638,6 +697,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 aux_data,
                 fastdiv_mods,
             )
+            if const_expr(self.cta_score_publication):
+                warp_idx_in_mma = warp_idx - 4
+                if warp_idx_in_mma < 4:
+                    cute.arch.setmaxregister_increase(self.num_mma_regs)
+                    self.mma(*mma_args, is_score_owner=True)
+                else:
+                    cute.arch.setmaxregister_increase(self.num_mma_regs)
+                    self.mma(*mma_args, is_score_owner=False)
+            else:
+                cute.arch.setmaxregister_increase(self.num_mma_regs)
+                self.mma(*mma_args, is_score_owner=True)
 
     @cute.jit
     def load(
@@ -948,6 +1018,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sK: cute.Tensor,
         sVt: cute.Tensor,
         sP: Optional[cute.Tensor],
+        score_stats: Optional[cute.Tensor],
         sO: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
         pipeline_k: pipeline.PipelineAsync,
@@ -965,6 +1036,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
+        is_score_owner: cutlass.Constexpr[bool] = True,
     ):
         aux_tensors = aux_data.tensors
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -976,16 +1048,37 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         num_wg_mma_qk = tiled_mma_qk.size // self.num_threads_per_warp_group
         qk_tidx = tidx % tiled_mma_qk.size
         thr_mma_qk = tiled_mma_qk.get_slice(qk_tidx)
-        wg_mma_qk = tiled_mma_qk.get_slice(
-            (warp_group_idx % num_wg_mma_qk) * self.num_threads_per_warp_group
-        )
         wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
-        _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
-            wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
-        )
-        mma_qk_fn = partial(
-            sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
-        )
+        mma_qk_fn = None
+        if const_expr(self.cta_score_publication):
+            if const_expr(is_score_owner):
+                wg_mma_qk = tiled_mma_qk.get_slice(
+                    (warp_group_idx % num_wg_mma_qk) * self.num_threads_per_warp_group
+                )
+                _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
+                    wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
+                )
+                mma_qk_fn = partial(
+                    sm90_utils.gemm_zero_init,
+                    tiled_mma_qk,
+                    (self.tile_m, self.tile_n),
+                    tSrQ,
+                    tSrK,
+                )
+        else:
+            wg_mma_qk = tiled_mma_qk.get_slice(
+                (warp_group_idx % num_wg_mma_qk) * self.num_threads_per_warp_group
+            )
+            _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
+                wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
+            )
+            mma_qk_fn = partial(
+                sm90_utils.gemm_zero_init,
+                tiled_mma_qk,
+                (self.tile_m, self.tile_n),
+                tSrQ,
+                tSrK,
+            )
         acc_O, tOrP, tOrVt = sm90_utils.partition_fragment_ABC(
             wg_mma_pv, (self.tile_m, self.tile_hdimv, self.tile_n), sP, sVt
         )
@@ -994,11 +1087,25 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         # Smem copy atom tiling
         # ///////////////////////////////////////////////////////////////////////////////
-        smem_copy_atom_P = utils.get_smem_store_atom(
-            self.arch.major * 10 + self.arch.minor, self.dtype
-        )
-        smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(qk_tidx)
-        tPsP = smem_thr_copy_P.partition_D(sP) if const_expr(sP is not None) else None
+        smem_thr_copy_P = None
+        tPsP = None
+        if const_expr(self.cta_score_publication):
+            if const_expr(is_score_owner):
+                smem_copy_atom_P = utils.get_smem_store_atom(
+                    self.arch.major * 10 + self.arch.minor, self.dtype
+                )
+                smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(
+                    qk_tidx
+                )
+                tPsP = smem_thr_copy_P.partition_D(sP)
+        else:
+            smem_copy_atom_P = utils.get_smem_store_atom(
+                self.arch.major * 10 + self.arch.minor, self.dtype
+            )
+            smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(
+                qk_tidx
+            )
+            tPsP = smem_thr_copy_P.partition_D(sP) if const_expr(sP is not None) else None
         smem_copy_params = SimpleNamespace(smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP)
 
         self.mma_init()
@@ -1031,6 +1138,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             acc_O=acc_O,
             tOrP=tOrP,
             smem_copy_params=smem_copy_params,
+            score_stats=score_stats,
+            qk_tidx=qk_tidx,
+            is_score_owner=is_score_owner,
             check_inf=True,
             scores_scale=scores_scale,
         )
@@ -1041,6 +1151,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline_k=pipeline_k,
             tOrP=tOrP,
             smem_copy_params=smem_copy_params,
+            score_stats=score_stats,
+            qk_tidx=qk_tidx,
+            is_score_owner=is_score_owner,
             scores_scale=scores_scale,
             softmax=softmax,
             acc_O=acc_O,
@@ -1251,7 +1364,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
 
             # normalize acc_O by row_sum and calculate the lse
-            row_scale = softmax.finalize(sink_val=sink_val)
+            if const_expr(self.cta_score_publication):
+                if const_expr(is_score_owner):
+                    scores_scale.store(softmax.finalize().load())
+                self.publish_score_stats(
+                    scores_scale,
+                    score_stats,
+                    qk_tidx,
+                    secondary=softmax.row_sum,
+                )
+                row_scale = scores_scale
+            else:
+                row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1285,6 +1409,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k,
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
+        score_stats: Optional[cute.Tensor],
+        qk_tidx: Int32,
+        is_score_owner: cutlass.Constexpr[bool],
         softmax: Softmax,
         seqlen: SeqlenInfoQK,
         scores_scale: Optional[cute.Tensor] = None,
@@ -1296,39 +1423,54 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         """Processes the first half block when using intra-warpgroup-overlap"""
 
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
-        acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
-        pipeline_k.consumer_release(kv_consumer_state)
+        if const_expr(self.cta_score_publication):
+            if const_expr(is_score_owner):
+                acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+                mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
+                row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
+                scores_scale.store(row_scale.load())
+                tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+                tOrP_cur = cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
+                tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+                tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+                cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
+            self.publish_score_stats(scores_scale, score_stats, qk_tidx)
+            pipeline_k.consumer_release(kv_consumer_state)
+        else:
+            acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+            pipeline_k.consumer_release(kv_consumer_state)
 
-        # Apply score modification if present
-        if const_expr(score_mod_fn is not None):
-            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+            # Apply score modification if present
+            if const_expr(score_mod_fn is not None):
+                score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
 
-        # Apply mask; mask_seqlen always True for first block
-        # Caveat: if full block further right than mask block, seqlen masking is redundant;
-        # however, masking is being applied anyway, so essentially no perf hit
-        mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
+            # Apply mask; mask_seqlen always True for first block
+            # Caveat: if full block further right than mask block, seqlen masking is redundant;
+            # however, masking is being applied anyway, so essentially no perf hit
+            mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
 
-        row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
+            row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
 
-        tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
-        tOrP_cur = (
-            tOrP
-            if const_expr(self.mma_pv_is_rs)
-            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
-        )
-        tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+            tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+            tOrP_cur = (
+                tOrP
+                if const_expr(self.mma_pv_is_rs)
+                else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
+            )
+            tOrP_cur.store(tOrP_acc.load().to(self.dtype))
 
-        if const_expr(not self.mma_pv_is_rs):
-            tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
-            cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
-            # Fence and barrier to make smem store visible to WGMMA
-            cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()
+            if const_expr(not self.mma_pv_is_rs):
+                tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+                cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
+                # Fence and barrier to make smem store visible to WGMMA
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()
 
         # For RescaleOBeforeGemm: initialize acc_O
         if const_expr(self.rescale_O_before_gemm):
             acc_O.fill(0.0)
-            scores_scale.store(row_scale.load())
+            if const_expr(not self.cta_score_publication):
+                scores_scale.store(row_scale.load())
 
         return kv_consumer_state
 
@@ -1351,6 +1493,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
+        if const_expr(self.cta_score_publication):
+            # Protect sP reuse by the next persistent work tile.
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PEmpty),
+                number_of_threads=self.num_mma_threads,
+            )
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
         return kv_consumer_state
@@ -1367,6 +1515,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_O: cute.Tensor,
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
+        score_stats: Optional[cute.Tensor],
+        qk_tidx: Int32,
+        is_score_owner: cutlass.Constexpr[bool],
         softmax: Softmax,
         seqlen: SeqlenInfoQK,
         scores_scale: Optional[cute.Tensor] = None,  # not used
@@ -1429,6 +1580,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_O: cute.Tensor,
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
+        score_stats: Optional[cute.Tensor],
+        qk_tidx: Int32,
+        is_score_owner: cutlass.Constexpr[bool],
         softmax: Softmax,
         seqlen: SeqlenInfoQK,
         scores_scale: Optional[cute.Tensor] = None,
@@ -1441,50 +1595,105 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # S = Q @ K.T
-        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        if const_expr(self.cta_score_publication):
+            if const_expr(is_score_owner):
+                acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        else:
+            acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         # RescaleOBeforeGemm: rescale O while QK GEMM is in flight, before PV GEMM
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
         pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
-        self.warp_scheduler_barrier_arrive()
+        if const_expr(not self.cta_score_publication):
+            self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)
         pipeline_k.consumer_release(smem_pipe_read)
 
-        # handle score mods and masking
-        if const_expr(score_mod_fn is not None):
-            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
-        if const_expr(mask_fn is not None):
-            mask_fn(acc_S=acc_S, n_block=n_block)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
+        if const_expr(self.cta_score_publication):
+            if const_expr(is_score_owner):
+                if const_expr(mask_fn is not None):
+                    mask_fn(acc_S=acc_S, n_block=n_block)
+                row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+                scores_scale.store(row_scale.load())
+        else:
+            # handle score mods and masking
+            if const_expr(score_mod_fn is not None):
+                score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+            if const_expr(mask_fn is not None):
+                mask_fn(acc_S=acc_S, n_block=n_block)
+            # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
 
-        row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+            row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
         warpgroup.wait_group(0)
+        if const_expr(self.cta_score_publication):
+            # Both warp groups must finish reading single-buffered sP before its next write.
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PEmpty),
+                number_of_threads=self.num_mma_threads,
+            )
         pipeline_v.consumer_release(smem_pipe_read_v)
-        tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
-        tOrP_cur = (
-            tOrP
-            if const_expr(self.mma_pv_is_rs)
-            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
-        )
-        # tOrP_cur.store(tOrP_acc.load().to(self.dtype))
-        # the "to(self.dtype)" conversion fails to vectorize for block sizes other
-        # than 128 x 128, i.e. it calls convert on 1 fp32 element at a time instead of
-        # 2 elements. So we just call ptx directly.
-        utils.cvt_f16(tOrP_acc, tOrP_cur)
-        if const_expr(not self.mma_pv_is_rs):
-            tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
-            cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
-        if const_expr(not self.rescale_O_before_gemm):
-            softmax.rescale_O(acc_O, row_scale)
-        if const_expr(self.rescale_O_before_gemm):
-            scores_scale.store(row_scale.load())
-        if const_expr(not self.mma_pv_is_rs):
-            # Fence and barrier to make sure smem store is visible to WGMMA
-            cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+        if const_expr(self.cta_score_publication):
+            if const_expr(is_score_owner):
+                tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+                tOrP_cur = cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
+                utils.cvt_f16(tOrP_acc, tOrP_cur)
+                tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+                cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
+            self.publish_score_stats(scores_scale, score_stats, qk_tidx)
+        else:
+            tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+            tOrP_cur = (
+                tOrP
+                if const_expr(self.mma_pv_is_rs)
+                else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
+            )
+            # tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+            # the "to(self.dtype)" conversion fails to vectorize for block sizes other
+            # than 128 x 128, i.e. it calls convert on 1 fp32 element at a time instead of
+            # 2 elements. So we just call ptx directly.
+            utils.cvt_f16(tOrP_acc, tOrP_cur)
+            if const_expr(not self.mma_pv_is_rs):
+                tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+                cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
+            if const_expr(not self.rescale_O_before_gemm):
+                softmax.rescale_O(acc_O, row_scale)
+            if const_expr(self.rescale_O_before_gemm):
+                scores_scale.store(row_scale.load())
+            if const_expr(not self.mma_pv_is_rs):
+                # Fence and barrier to make sure smem store is visible to WGMMA
+                cute.arch.fence_view_async_shared()
+                cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         return smem_pipe_read
+
+    @cute.jit
+    def publish_score_stats(
+        self,
+        primary: cute.Tensor,
+        score_stats: cute.Tensor,
+        qk_tidx: Int32,
+        secondary: Optional[cute.Tensor] = None,
+    ):
+        assert cute.size(primary) * self.num_threads_per_warp_group == self.tile_m * 4
+        warp_group_idx = cute.arch.make_warp_uniform(
+            cute.arch.thread_idx()[0] // self.num_threads_per_warp_group
+        )
+        # Global warp group 0 is the producer, so consumer warp group 0 is global group 1.
+        if warp_group_idx == 1:
+            for r in cutlass.range_constexpr(cute.size(primary)):
+                score_stats[qk_tidx, r, 0] = primary[r]
+                if const_expr(secondary is not None):
+                    score_stats[qk_tidx, r, 1] = secondary[r]
+            cute.arch.fence_view_async_shared()
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.PFull),
+            number_of_threads=self.num_mma_threads,
+        )
+        for r in cutlass.range_constexpr(cute.size(primary)):
+            primary[r] = score_stats[qk_tidx, r, 0]
+            if const_expr(secondary is not None):
+                secondary[r] = score_stats[qk_tidx, r, 1]
 
     @cute.jit
     def mma_init(self):
