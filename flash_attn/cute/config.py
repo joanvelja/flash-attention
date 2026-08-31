@@ -265,9 +265,11 @@ def select_sm90_tile(
     elif head_dim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return 128, tile_n, True, True
-    else:  # hdim 256
+    elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return 128, tile_n, True, True
+    else:  # D512 splits the PV accumulator across two warp groups.
+        return 64, 64, False, True
 
 
 def fit_sm90_tile_to_block_sparsity(
@@ -467,7 +469,9 @@ SM90_TMA_REGISTERS = {
 
 
 def select_sm90_registers(inputs: FwdHeuristicInputs, *, tile_m: int, tile_n: int) -> Sm90Registers:
-    num_mma_warp_groups = tile_m // 64
+    num_mma_warp_groups = max(
+        tile_m // 64, 2 if max(inputs.head_dim, inputs.head_dim_v) > 256 else 1
+    )
     tma_q = not (inputs.pack_gqa and tile_m % inputs.qhead_per_kvhead != 0)
     tma_kv = inputs.page_size in (None, tile_n)
     # A cp.async Q or KV producer needs more registers.
@@ -515,7 +519,7 @@ def check_register_record(registers: object, expected: type, kernel: str) -> Non
         raise ValueError(f"Register counts must be multiples of 8 in [24, 256], got {registers}")
 
 
-def validate_registers(config: "FwdConfig") -> None:
+def validate_registers(config: "FwdConfig", inputs: FwdHeuristicInputs) -> None:
     """Reject register splits the kernels cannot apply with setmaxnreg."""
     registers = config.registers
     expected = {9: Sm90Registers, 10: Sm100Registers, 11: Sm100Registers}.get(
@@ -525,7 +529,9 @@ def validate_registers(config: "FwdConfig") -> None:
     if registers is None:
         return
     if isinstance(registers, Sm90Registers):
-        num_mma_warp_groups = config.tile_m // 64
+        num_mma_warp_groups = max(
+            config.tile_m // 64, 2 if max(inputs.head_dim, inputs.head_dim_v) > 256 else 1
+        )
         launch = 65536 // (128 * (num_mma_warp_groups + 1))
         budget = num_mma_warp_groups * registers.mma + registers.producer
         if not registers.producer <= launch <= registers.mma:
@@ -1650,7 +1656,7 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
                 f"SM{capacity} forward does not support SM100-only options: "
                 + ", ".join(f"{n}={getattr(config, n)} (needs {neutral[n]})" for n in mismatched)
             )
-        validate_registers(config)
+        validate_registers(config, inputs)
         return
 
     if config.ex2_emu_freq < 0 or config.ex2_emu_start_frg < 0:
@@ -1722,7 +1728,7 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
     ):
         raise ValueError("2CTA instructions are not supported for this forward problem")
     validate_sm100_smem_layout(config, inputs)
-    validate_registers(config)
+    validate_registers(config, inputs)
 
 
 def validate_sm100_smem_layout(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
@@ -2460,6 +2466,18 @@ def select_sm90_bwd_tile(
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h, benchmarked on H100 SXM.
     """
+    if max(head_dim, head_dim_v) > 256:
+        if (head_dim, head_dim_v) != (512, 512):
+            raise NotImplementedError(
+                "SM90 backward supports head dimensions up to 256 or exactly (512, 512); "
+                f"got ({head_dim}, {head_dim_v})"
+            )
+        return dict(
+            tile_m=64, tile_n=32,
+            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+        )
     if head_dim <= 128:
         # C++ FA3: hdim 64: 128x128 (2, 2, true, false, false, 2, 1, 2, 2); hdim 96: 64x128;
         # hdim 128: 64x128 causal/local, else 80x128 with dQ_swapAB.
@@ -2681,7 +2699,9 @@ def validate_bwd_registers(config: BwdConfig) -> None:
 SM90_SMEM_BYTES = 227 * 1024
 
 
-def sm90_bwd_smem_bytes(config: BwdConfig, tile_hdim: int, tile_hdimv: int) -> int:
+def sm90_bwd_smem_bytes(
+    config: BwdConfig, tile_hdim: int, tile_hdimv: int, *, split_d512: bool = False
+) -> int:
     """Bytes of FlashAttentionBackwardSm90's SharedStorage (_get_shared_storage_cls), in order."""
     element_bytes = 2  # FP16 / BF16
     Q_stage, dO_stage = config.num_stages_Q, config.num_stages_dO
@@ -2704,7 +2724,7 @@ def sm90_bwd_smem_bytes(config: BwdConfig, tile_hdim: int, tile_hdimv: int) -> i
         (config.tile_m * tile_hdimv * dO_stage * element_bytes, 1024),  # sdO
         (0 if mma_dkv_is_rs else PdS_bytes, 1024),  # sP
         (PdS_bytes, 1024),  # sdS
-        (4 * config.tile_m * tile_hdim, 1024),  # sdQaccum (fp32)
+        (0 if split_d512 else 4 * config.tile_m * tile_hdim, 1024),  # sdQaccum (fp32)
     )
     total = 0
     for size, align in buffers:
@@ -2756,7 +2776,10 @@ def validate_sm90_bwd_mma(config: BwdConfig, inputs: BwdHeuristicInputs) -> None
                 f"SM90 {name} WGMMA (swapAB={swap}) cannot tile {m}x{n} over "
                 f"{atom_m}x{atom_n} warp groups of 64-row atoms"
             )
-    smem_bytes = sm90_bwd_smem_bytes(config, tile_hdim, tile_hdimv)
+    smem_bytes = sm90_bwd_smem_bytes(
+        config, tile_hdim, tile_hdimv,
+        split_d512=(inputs.head_dim, inputs.head_dim_v) == (512, 512),
+    )
     if smem_bytes > SM90_SMEM_BYTES:
         raise ValueError(
             f"SM90 backward tiles {(config.tile_m, config.tile_n)} with Q/dO/PdS stages "

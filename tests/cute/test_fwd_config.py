@@ -757,3 +757,11 @@ def test_tuned_rule_boundaries(rule, changes, fires):
     changed = {name for name in tuned if tuned[name] != untuned[name]}
 
     assert tuned_fields <= changed if fires else not changed
+
+
+def test_sm90_d512_uses_two_pv_warp_groups():
+    inputs = make_inputs(device_arch=90, head_dim=512, head_dim_v=512, num_heads_kv=2)
+    config = select_fwd_config(inputs)
+    assert (config.tile_m, config.tile_n) == (64, 64)
+    assert config.registers == Sm90Registers(mma=240, producer=24)
+    validate_fwd_config(config, inputs)
