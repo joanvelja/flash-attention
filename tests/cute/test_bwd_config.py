@@ -462,3 +462,12 @@ def test_cross_compiled_gqa_backward_needs_num_sms_only_to_pack(
                 q, k, v, out, torch.empty_like(out), lse, score_mod=score_mod,
                 score_mod_bwd=score_mod,
             )
+
+
+def test_sm90_d512_split_tiles_fit_shared_memory():
+    inputs = make_inputs(device_arch=90, head_dim=512, head_dim_v=512, num_heads_kv=2, causal=True)
+    config = select_bwd_config(inputs)
+    assert (config.tile_m, config.tile_n) == (64, 32)
+    assert (config.num_stages_Q, config.num_stages_dO, config.num_stages_PdS) == (1, 1, 1)
+    assert config.dKV_swapAB
+    validate_bwd_config(config, inputs)
