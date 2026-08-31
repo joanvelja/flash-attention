@@ -43,7 +43,10 @@ from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleT
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+from flash_attn.cute.flash_bwd_sm90 import (
+    FlashAttentionBackwardSm90,
+    FlashAttentionBackwardSm90Split,
+)
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import (
@@ -116,11 +119,17 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
-    is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    is_sm90_legacy_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    is_sm90_d512_shape = head_dim == 512 and head_dim_v == 512
     if compute_capability == 9:
-        assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        assert (
+            (is_sm90_legacy_range or is_sm90_d512_shape)
+            and head_dim % alignment == 0
+            and head_dim_v % alignment == 0
+        ), (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
-            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+            f"head_dim and head_dim_v must be between 8 and 256 or exactly (512, 512), "
+            f"and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
         assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_dedicate_kernel_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
@@ -169,9 +178,11 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
     elif head_dim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
+    elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
+    else:  # SM90 D512
+        return FwdConfig(64, 64, False, True)
 
 @dataclass(frozen=True)
 class BwdConfig:
@@ -188,6 +199,7 @@ class BwdConfig:
     AtomLayoutMdQ: int
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
+    dQ_accum_lane_contiguous: bool = False
 
 
 def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
@@ -196,6 +208,11 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
     benchmarked on H100 SXM.
     """
+    if (head_dim > 256 or head_dim_v > 256) and (head_dim, head_dim_v) != (512, 512):
+        raise NotImplementedError(
+            "SM90 backward supports head dimensions up to 256 or exactly (512, 512); "
+            f"got ({head_dim}, {head_dim_v})"
+        )
     if head_dim <= 64:
         # C++ FA3: 128, 128, 64, ..., 2, 2, true, false, false, 2, 1, 2, 2
         return BwdConfig(
@@ -245,13 +262,23 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
                 num_wg=2,
             )
-    else:
-        # hdim 256
+    elif head_dim <= 256:
         return BwdConfig(
             m_block_size=64, n_block_size=64,
             num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
             SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+        )
+    else:
+        # Transposed dKV MMA keeps the D512 dK/dV
+        # accumulators within the Hopper register budget; N32 lets both warp
+        # groups partition score/dP into valid 16-column WGMMA tiles.
+        return BwdConfig(
+            m_block_size=64, n_block_size=32,
+            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+            AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            dQ_accum_lane_contiguous=True,
         )
 
 
@@ -683,6 +710,15 @@ def _flash_attn_fwd(
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+    is_sm90_d512_shape = arch // 10 == 9 and head_dim == 512 and head_dim_v == 512
+    if is_sm90_d512_shape and page_table is not None:
+        raise NotImplementedError("SM90 D512 paged KV is not implemented")
+    if num_splits < 1 and arch // 10 in [8, 9]:
+        # SM80/SM90 forward has no SplitKV kernel, so auto resolves to the only
+        # supported value instead of reaching the unsupported split dispatch.
+        num_splits = 1
+    if is_sm90_d512_shape and num_splits > 1:
+        raise NotImplementedError("SM90 D512 SplitKV is not implemented; num_splits must be 1 (or 0 = auto)")
     if softmax_scale is None:
         softmax_scale = (
             1.0 / math.sqrt(head_dim) if qv is None or q is None
@@ -1274,8 +1310,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                # num_stages=1,
-                num_stages=2,
+                num_stages=1 if head_dim > 256 or head_dim_v > 256 else 2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -1719,6 +1754,7 @@ _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
 
 def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+    dQ_accum_lane_contiguous,
     has_cuseqlens_q, has_seqused_q,
     use_2cta_instrs, cluster_size, arch,
     has_cu_total_m_blocks,
@@ -1745,6 +1781,7 @@ def _compile_bwd_postprocess(
     )
     fa_bwd_post = FlashAttentionBackwardPostprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
+        dQ_accum_lane_contiguous=dQ_accum_lane_contiguous,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
     )
@@ -1762,6 +1799,7 @@ def _bwd_postprocess_convert(
     cu_seqlens, seqused,
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
+    dQ_accum_lane_contiguous=False,
     use_2cta_instrs=False, cluster_size=1,
     cu_total_m_blocks=None,
     sink_tensors=None,
@@ -1782,6 +1820,7 @@ def _bwd_postprocess_convert(
         )
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+        dQ_accum_lane_contiguous,
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
         cu_total_m_blocks is not None,
@@ -1887,6 +1926,7 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+    dQ_accum_lane_contiguous = False
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
@@ -1934,6 +1974,7 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = cfg.AtomLayoutMdQ
         num_threads = (cfg.num_wg + 1) * 128
         dQ_single_wg = cfg.dQ_single_wg
+        dQ_accum_lane_contiguous = cfg.dQ_accum_lane_contiguous
         cluster_size = 1
         use_2cta_instrs = False
     else:
@@ -2086,11 +2127,36 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
+    is_sm90_d512_shape = arch // 10 == 9 and head_dim == 512 and head_dim_v == 512
+    if is_sm90_d512_shape:
+        unsupported = []
+        if not causal or local:
+            unsupported.append("non-causal or local attention")
+        if qhead_per_kvhead not in (4, 8, 16):
+            unsupported.append(f"GQA ratio {qhead_per_kvhead} (expected one of 4, 8, 16)")
+        if deterministic:
+            unsupported.append("deterministic backward")
+        if softcap != 0.0 or score_mod is not None or score_mod_bwd is not None:
+            unsupported.append("softcap or score_mod")
+        if mask_mod is not None or block_sparse_tensors is not None:
+            unsupported.append("mask_mod or block sparsity")
+        if aux_tensors is not None:
+            unsupported.append("auxiliary tensors")
+        if dlse is not None:
+            unsupported.append("dLSE")
+        if seqused_q is not None or seqused_k is not None:
+            unsupported.append("seqused_q or seqused_k")
+        if unsupported:
+            raise NotImplementedError(
+                "SM90 D512 backward currently supports only causal global attention "
+                "with GQA ratio 4, 8, or 16; unsupported: " + ", ".join(unsupported)
+            )
+    use_sm90_d512_split = is_sm90_d512_shape
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    
+
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
             "softcap and score_mod/score_mod_bwd cannot be used together"
@@ -2314,6 +2380,8 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs,
             dQ_single_wg,
+            dQ_accum_lane_contiguous,
+            use_sm90_d512_split,
             deterministic,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
@@ -2335,6 +2403,7 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             single_q_block,
             single_k_block,
+            cu_total_m_blocks_q is not None,
             cu_total_m_blocks_k is not None,
         )
     else:
@@ -2376,6 +2445,7 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             single_q_block,
             single_k_block,
+            cu_total_m_blocks_q is not None,
             cu_total_m_blocks_k is not None,
         )
 
@@ -2395,9 +2465,23 @@ def _flash_attn_bwd(
             dk_accum_tensor, dv_accum_tensor = [
                 to_cute_tensor(t) for t in (dk_accum, dv_accum)
             ]
-        cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, cu_total_m_blocks_k_tensor = [
+        (
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
+            cu_total_m_blocks_q_tensor,
+            cu_total_m_blocks_k_tensor,
+        ) = [
             to_cute_tensor(t, assumed_align=4) if t is not None else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cu_total_m_blocks_k)
+            for t in (
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                cu_total_m_blocks_q,
+                cu_total_m_blocks_k,
+            )
         ]
         dQ_semaphore_tensor, dK_semaphore_tensor, dV_semaphore_tensor = [
             utils.convert_from_dlpack_leading_static(t.detach(), leading_dim=3, alignment=4, stride_order=t.dim_order())
@@ -2430,33 +2514,50 @@ def _flash_attn_bwd(
                 score_mod_bwd=score_mod_bwd,
             )
         elif arch // 10 == 9:
-            fa_bwd_obj = FlashAttentionBackwardSm90(
+            sm90_args = (
                 dtype,
                 head_dim,
                 head_dim_v,
                 qhead_per_kvhead,
                 causal,
-                is_local=local,
-                deterministic=deterministic,
-                tile_m=m_block_size,
-                tile_n=n_block_size,
-                Q_stage=num_stages_Q,
-                dO_stage=num_stages_dO,
-                PdS_stage=num_stages_PdS,
-                SdP_swapAB=SdP_swapAB,
-                dKV_swapAB=dKV_swapAB,
-                dQ_swapAB=dQ_swapAB,
-                AtomLayoutMSdP=AtomLayoutMSdP,
-                AtomLayoutNdKV=AtomLayoutNdKV,
-                AtomLayoutMdQ=AtomLayoutMdQ,
-                num_threads=num_threads,
-                V_in_regs=V_in_regs,
-                score_mod=score_mod,
-                score_mod_bwd=score_mod_bwd,
-                mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None,
-                q_subtile_factor=q_subtile_factor,
-                dQ_single_wg=dQ_single_wg,
+            )
+            sm90_kwargs = {
+                "is_local": local,
+                "deterministic": deterministic,
+                "tile_m": m_block_size,
+                "tile_n": n_block_size,
+                "Q_stage": num_stages_Q,
+                "dO_stage": num_stages_dO,
+                "PdS_stage": num_stages_PdS,
+                "SdP_swapAB": SdP_swapAB,
+                "dKV_swapAB": dKV_swapAB,
+                "dQ_swapAB": dQ_swapAB,
+                "AtomLayoutMSdP": AtomLayoutMSdP,
+                "AtomLayoutNdKV": AtomLayoutNdKV,
+                "AtomLayoutMdQ": AtomLayoutMdQ,
+                "num_threads": num_threads,
+                "V_in_regs": V_in_regs,
+                "score_mod": score_mod,
+                "score_mod_bwd": score_mod_bwd,
+                "mask_mod": mask_mod,
+                "has_aux_tensors": aux_tensors is not None,
+                "q_subtile_factor": q_subtile_factor,
+                "dQ_single_wg": dQ_single_wg,
+                "dQ_accum_lane_contiguous": dQ_accum_lane_contiguous,
+            }
+            fa_bwd_obj = (
+                FlashAttentionBackwardSm90Split(
+                    *(
+                        FlashAttentionBackwardSm90(
+                            *sm90_args,
+                            **sm90_kwargs,
+                            split_mode=split_mode,
+                        )
+                        for split_mode in ("dq", "dkv")
+                    )
+                )
+                if use_sm90_d512_split
+                else FlashAttentionBackwardSm90(*sm90_args, **sm90_kwargs)
             )
         else:
             if use_dedicated_hd256_kernel:
@@ -2542,7 +2643,12 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
         ]
         if not use_dedicated_hd256_kernel:
-            compile_args.append(cu_total_m_blocks_k_tensor)
+            if use_sm90_d512_split:
+                compile_args.extend(
+                    [cu_total_m_blocks_q_tensor, cu_total_m_blocks_k_tensor]
+                )
+            else:
+                compile_args.append(cu_total_m_blocks_k_tensor)
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -2586,7 +2692,10 @@ def _flash_attn_bwd(
             else None,
         ]
         if not use_dedicated_hd256_kernel:
-            call_args.append(cu_total_m_blocks_k)
+            if use_sm90_d512_split:
+                call_args.extend([cu_total_m_blocks_q, cu_total_m_blocks_k])
+            else:
+                call_args.append(cu_total_m_blocks_k)
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
@@ -2599,11 +2708,15 @@ def _flash_attn_bwd(
             num_threads_post_dQ = 128
             num_threads_post_dKV = 128
 
+        # The split dq kernel owns its tile and stores dq_accum in the plain
+        # (M * K // num_wg, num_wg) convention; only the fused kernel's atomic path
+        # uses the lane-contiguous scratch layout.
         _bwd_postprocess_convert(
             dq_accum, dq, softmax_scale,
             cu_seqlens_q, seqused_q,
             arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
             AtomLayoutMdQ, dQ_swapAB,
+            dQ_accum_lane_contiguous=dQ_accum_lane_contiguous and not use_sm90_d512_split,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
             cu_total_m_blocks=cu_total_m_blocks_q,
             sink_tensors=(
