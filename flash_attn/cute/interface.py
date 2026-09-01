@@ -13,6 +13,8 @@ from typing import Callable, Optional, Tuple
 import torch
 
 
+FLASH_ATTN_CUTE_RING_ABI = 1
+
 
 import cutlass
 import cutlass.cute as cute
