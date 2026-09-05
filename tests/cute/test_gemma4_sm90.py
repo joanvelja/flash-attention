@@ -5,6 +5,7 @@ import torch
 from flash_attn.cute import flash_attn_func, flash_attn_varlen_func, utils
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
 pytestmark = pytest.mark.gpu
@@ -35,9 +36,10 @@ def _reference_dense(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     sequence_q, sequence_k = q.shape[0], k.shape[0]
     repeats = q.shape[1] // k.shape[1]
-    q_float = q.float().transpose(0, 1)
-    k_float = k.float().repeat_interleave(repeats, dim=1).transpose(0, 1)
-    v_float = v.float().repeat_interleave(repeats, dim=1).transpose(0, 1)
+    reference_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+    q_float = q.to(reference_dtype).transpose(0, 1)
+    k_float = k.to(reference_dtype).repeat_interleave(repeats, dim=1).transpose(0, 1)
+    v_float = v.to(reference_dtype).repeat_interleave(repeats, dim=1).transpose(0, 1)
     scores = torch.matmul(q_float, k_float.transpose(-1, -2)) * scale
     if softcap is not None:
         scores = softcap * torch.tanh(scores / softcap)
@@ -55,7 +57,12 @@ def _reference_dense(
     if dense_mask is not None:
         allowed &= dense_mask
     scores = scores.masked_fill(~allowed, -torch.inf)
-    output = torch.matmul(scores.softmax(-1), v_float).transpose(0, 1)
+    # Avoid evaluating softmax on all -inf rows: masking NaNs afterward also
+    # leaves NaNs in backward. Empty attention has zero output and derivatives.
+    valid_rows = allowed.any(-1, keepdim=True)
+    safe_scores = torch.where(valid_rows, scores, 0.0)
+    probabilities = safe_scores.softmax(-1) * valid_rows
+    output = torch.matmul(probabilities, v_float).transpose(0, 1)
     return output, torch.logsumexp(scores, dim=-1)
 
 
@@ -182,20 +189,82 @@ def test_gemma4_sm90_varlen_canary(
             assert torch.isfinite(actual).all()
 
 
+@pytest.mark.parametrize(("query_heads", "key_value_heads"), [(4, 1), (8, 1)], ids=("gqa4", "gqa8"))
+def test_gemma4_sm90_d512_production_bf16_varlen(query_heads: int, key_value_heads: int) -> None:
+    """The Gemma 4 global-attention production contract, and that the fast path is taken.
+
+    BF16, head dim 512, causal varlen, global window, softmax scale 1.0. The ring wrapper
+    gathers one KV head per call, so the inner call is GQA4 (E4B) or GQA8 (26B-A4B, 31B).
+    Tensors here are compact; the noncompact ring head slices are the replay harness's job.
+
+    The selector assertion is deliberate coupling: a numerical check alone still passes if
+    the score-publication gate is accidentally closed, since the generic path is correct too.
+    """
+    _assert_sm90()
+    torch.manual_seed(512 + query_heads)
+    lengths = [4096, 3000, 1096]
+    q = torch.randn(sum(lengths), query_heads, 512, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lengths), key_value_heads, 512, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    # The gate is only consulted when a kernel is actually compiled, so an earlier test that
+    # already cached this configuration would leave `selected` empty and make the assertion
+    # vacuous. Force the compile.
+    _flash_attn_fwd.compile_cache.clear()
+
+    selected: list[bool] = []
+    original = FlashAttentionForwardSm90._supports_cta_score_publication
+
+    def record(self, *args, **kwargs):
+        chosen = original(self, *args, **kwargs)
+        selected.append(bool(chosen))
+        return chosen
+
+    FlashAttentionForwardSm90._supports_cta_score_publication = record
+    try:
+        output, lse = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=_cu_seqlens(lengths),
+            cu_seqlens_k=_cu_seqlens(lengths),
+            max_seqlen_q=max(lengths),
+            max_seqlen_k=max(lengths),
+            softmax_scale=1.0,
+            causal=True,
+            return_lse=True,
+        )
+    finally:
+        FlashAttentionForwardSm90._supports_cta_score_publication = original
+
+    assert selected, "the score-publication gate was never consulted"
+    assert all(selected), (
+        "score publication must stay selected for the production contract "
+        f"(bf16, causal varlen, global, GQA{query_heads // key_value_heads})"
+    )
+
+    output_ref, lse_ref = _reference_varlen(
+        q, k, v, lengths, lengths, 1.0, True, (None, None)
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), output_ref.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.float(), lse_ref.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=("fp16", "bf16"))
 @pytest.mark.parametrize(
     ("query_heads", "key_value_heads"),
     [(8, 2), (16, 2), (16, 1)],
     ids=("gqa4", "gqa8", "gqa16"),
 )
-def test_gemma4_sm90_d512_fp16_batch_backward(
+def test_gemma4_sm90_d512_batch_backward(
     query_heads: int,
     key_value_heads: int,
+    dtype: torch.dtype,
 ) -> None:
     _assert_sm90()
     torch.manual_seed(2512 + query_heads + key_value_heads)
     query_length, key_length = 129, 257
-    q = torch.randn(1, query_length, query_heads, 512, device="cuda", dtype=torch.float16, requires_grad=True)
-    k = torch.randn(1, key_length, key_value_heads, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+    q = torch.randn(1, query_length, query_heads, 512, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(1, key_length, key_value_heads, 512, device="cuda", dtype=dtype, requires_grad=True)
     v = torch.randn_like(k, requires_grad=True)
     q_ref = q.detach().clone().requires_grad_()
     k_ref = k.detach().clone().requires_grad_()
@@ -223,7 +292,7 @@ def test_gemma4_sm90_d512_fp16_batch_backward(
     ):
         relative_l2 = _relative_l2(actual, expected)
         print(
-            f"fp16-d512 {name}: relative_l2={relative_l2:.8f}, "
+            f"{dtype}-d512 {name}: relative_l2={relative_l2:.8f}, "
             f"max_abs={float((actual.float() - expected.float()).abs().max()):.8f}",
             flush=True,
         )
@@ -375,6 +444,149 @@ def test_gemma4_sm90_d512_block_sparse() -> None:
     output_ref, lse_ref = _reference_dense(q[0], k[0], v[0], 0.07, True, (None, None))
     torch.testing.assert_close(output[0].float(), output_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(lse[0].float(), lse_ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
+@pytest.mark.parametrize(("query_heads", "parent_heads"), [(4, 8), (8, 16), (16, 16)])
+def test_gemma4_sm90_d512_strided_rms_backward(
+    dtype: torch.dtype, query_heads: int, parent_heads: int
+) -> None:
+    """Scale-one backward with the noncompact head slices used by ring attention."""
+    _assert_sm90()
+    torch.manual_seed(20260905 + query_heads)
+    sequence_q, sequence_k, head_dim = 129, 257, 512
+    q_parent = torch.randn(sequence_q, parent_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(sequence_k, 1, head_dim, device="cuda", dtype=dtype)
+    q_parent = (q_parent.float() * q_parent.float().square().mean(-1, keepdim=True).rsqrt()).to(dtype)
+    k = (k.float() * k.float().square().mean(-1, keepdim=True).rsqrt()).to(dtype)
+    v = torch.randn_like(k)
+    offset = query_heads if parent_heads > query_heads else 0
+    head_slice = slice(offset, offset + query_heads)
+    q = q_parent[:, head_slice]
+    out = torch.empty_like(q_parent)[:, head_slice]
+    dout = torch.randn_like(q_parent)[:, head_slice]
+    dq = torch.empty_like(q_parent)[:, head_slice]
+    q_ref, k_ref, v_ref = (x.detach().clone().requires_grad_(True) for x in (q, k, v))
+    kwargs = dict(
+        cu_seqlens_q=_cu_seqlens([sequence_q]),
+        cu_seqlens_k=_cu_seqlens([sequence_k]),
+        max_seqlen_q=sequence_q,
+        max_seqlen_k=sequence_k,
+        softmax_scale=1.0,
+        causal=True,
+    )
+    actual_out, lse, *_ = _flash_attn_fwd(q=q, k=k, v=v, out=out, return_lse=True, **kwargs)
+    gradients = _flash_attn_bwd(q, k, v, out, dout, lse, dq=dq, **kwargs)
+    expected_out, expected_lse = _reference_dense(q_ref, k_ref, v_ref, 1.0, True, (None, None))
+    expected_out.backward(dout.float())
+    assert actual_out.data_ptr() == out.data_ptr()
+    assert gradients[0].data_ptr() == dq.data_ptr()
+    assert out.stride() == dout.stride() == dq.stride() == q.stride()
+    for name, actual, expected in (
+        ("O", actual_out, expected_out),
+        ("LSE", lse, expected_lse),
+        ("dQ", gradients[0], q_ref.grad),
+        ("dK", gradients[1], k_ref.grad),
+        ("dV", gradients[2], v_ref.grad),
+    ):
+        assert torch.isfinite(actual).all()
+        difference = actual.double() - expected.double()
+        relative_l2 = float(difference.norm() / expected.double().norm())
+        max_abs = float(difference.abs().max())
+        print(f"{name}: relative_l2={relative_l2:.8f}, max_abs={max_abs:.8f}", flush=True)
+        assert relative_l2 <= 1e-2
+        if name in ("O", "LSE"):
+            assert max_abs <= 3e-2
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "query_heads", "parent_heads", "window_left", "dtype"),
+    [
+        (256, 2, 32, 1023, torch.bfloat16),
+        (256, 4, 8, 511, torch.bfloat16),
+        (256, 8, 8, 511, torch.bfloat16),
+        (256, 4, 8, 511, torch.float16),
+        (512, 8, 32, None, torch.bfloat16),
+    ],
+    ids=("local-gqa2", "local-gqa4", "local-gqa8", "local-gqa4-fp16", "global-gqa8"),
+)
+def test_gemma4_sm90_ragged_empty_strided_backward(
+    head_dim: int,
+    query_heads: int,
+    parent_heads: int,
+    window_left: int | None,
+    dtype: torch.dtype,
+) -> None:
+    """Empty rows, window eviction and ring head views against FP64 attention."""
+    _assert_sm90()
+    torch.manual_seed(20260905)
+    query_lengths = [0, 65, 17, 129]
+    key_lengths = [31, 31, 0, 257 if window_left is None else window_left + 129]
+    q_parent = torch.randn(sum(query_lengths), parent_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(sum(key_lengths), 1, head_dim, device="cuda", dtype=dtype)
+    q_parent = (q_parent.float() * q_parent.float().square().mean(-1, keepdim=True).rsqrt()).to(dtype)
+    k = (k.float() * k.float().square().mean(-1, keepdim=True).rsqrt()).to(dtype)
+    v = torch.randn_like(k)
+    offset = query_heads if parent_heads > query_heads else 0
+    head_slice = slice(offset, offset + query_heads)
+    out_parent = torch.full_like(q_parent, torch.nan)
+    dq_parent = torch.full_like(q_parent, torch.nan)
+    q = q_parent[:, head_slice]
+    out = out_parent[:, head_slice]
+    dout = torch.randn_like(q_parent)[:, head_slice]
+    dq = dq_parent[:, head_slice]
+    q_ref, k_ref, v_ref = (x.detach().double().requires_grad_(True) for x in (q, k, v))
+    window = (window_left, 0 if window_left is not None else None)
+    kwargs = dict(
+        cu_seqlens_q=_cu_seqlens(query_lengths),
+        cu_seqlens_k=_cu_seqlens(key_lengths),
+        max_seqlen_q=max(query_lengths),
+        max_seqlen_k=max(key_lengths),
+        softmax_scale=1.0,
+        causal=True,
+        window_size_left=window[0],
+        window_size_right=window[1],
+    )
+    actual_out, lse, *_ = _flash_attn_fwd(q=q, k=k, v=v, out=out, return_lse=True, **kwargs)
+    gradients = _flash_attn_bwd(q, k, v, out, dout, lse, dq=dq, **kwargs)
+    expected_out, expected_lse = _reference_varlen(
+        q_ref, k_ref, v_ref, query_lengths, key_lengths, 1.0, True, window
+    )
+    expected_out.backward(dout.double())
+    assert actual_out.data_ptr() == out.data_ptr()
+    assert gradients[0].data_ptr() == dq.data_ptr()
+    assert out.stride() == dout.stride() == dq.stride() == q.stride()
+    for parent in (out_parent, dq_parent):
+        assert torch.isnan(parent[:, :offset]).all()
+        assert torch.isnan(parent[:, offset + query_heads :]).all()
+
+    # Document 1 has 65 queries / 31 keys: its first 34 rows are fully masked.
+    # Document 2 has queries but no keys. Document 0 has keys but no queries.
+    for rows in (slice(0, 34), slice(65, 82)):
+        assert torch.count_nonzero(actual_out[rows]) == 0
+        assert torch.count_nonzero(gradients[0][rows]) == 0
+        assert torch.isneginf(lse[:, rows]).all()
+    for gradient in gradients[1:]:
+        assert torch.count_nonzero(gradient[:31]) == 0
+
+    for name, actual, expected in (
+        ("O", actual_out, expected_out),
+        ("LSE", lse, expected_lse),
+        ("dQ", gradients[0], q_ref.grad),
+        ("dK", gradients[1], k_ref.grad),
+        ("dV", gradients[2], v_ref.grad),
+    ):
+        assert not torch.isnan(actual).any()
+        assert not torch.isposinf(actual).any()
+        assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
+        finite = torch.isfinite(expected)
+        difference = actual.double()[finite] - expected[finite]
+        relative_l2 = float(difference.norm() / expected[finite].norm())
+        max_abs = float(difference.abs().max())
+        print(f"{name}: relative_l2={relative_l2:.8f}, max_abs={max_abs:.8f}", flush=True)
+        assert relative_l2 <= 1e-2
+        if name in ("O", "LSE"):
+            assert max_abs <= 3e-2
 
 
 def test_gemma4_sm90_d512_deterministic_backward_is_rejected() -> None:
