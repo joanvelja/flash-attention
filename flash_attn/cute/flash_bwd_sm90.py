@@ -186,11 +186,16 @@ class FlashAttentionBackwardSm90:
         # the full P/dS tile; both WGs retain their dQ/dK/dV partitions.
         self.single_wg_sdp = (
             self.num_wg_mma == 2
-            and not SdP_swapAB and not dQ_swapAB and not dQ_single_wg
+            and not SdP_swapAB
+            and not dQ_swapAB
+            and not dQ_single_wg
             and (AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ) == (1, 1, 1)
             and (Q_stage, dO_stage, PdS_stage) == (1, 1, 1)
-            and not deterministic and not V_in_regs
-            and score_mod is None and score_mod_bwd is None and mask_mod is None
+            and not deterministic
+            and not V_in_regs
+            and score_mod is None
+            and score_mod_bwd is None
+            and mask_mod is None
             and not has_aux_tensors
             and split_mode in ("dq", "dkv")
         )
@@ -364,7 +369,8 @@ class FlashAttentionBackwardSm90:
         if self.Q_in_regs:
             assert self.dKV_swapAB and not self.mma_dkv_is_rs
             tiled_mma_dK = sm90_utils_basic.make_trivial_tiled_mma(
-                self.dtype, self.dtype,
+                self.dtype,
+                self.dtype,
                 warpgroup.OperandMajorMode.K,
                 warpgroup.OperandMajorMode.MN,
                 Float32,
@@ -1531,9 +1537,7 @@ class FlashAttentionBackwardSm90:
                 def copy_Q_s2r(stage):
                     cute.copy(q_copy, q_src[None, None, None, stage], q_dst)
 
-                mma_dsq_fn = partial(
-                    gemm_w_idx, tiled_mma_dK, acc_dK, tdKrQt, tdKrdSt
-                )
+                mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tdKrQt, tdKrdSt)
             elif const_expr(not self.mma_dkv_is_rs):
                 mma_dsq_fn = partial(
                     gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt, swap_AB=self.dKV_swapAB
