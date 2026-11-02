@@ -2055,7 +2055,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                 cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                 mdQ_tma_eff = mdQ_tma
-                if cutlass.const_expr(varlen):
+                if cutlass.const_expr(cum_seqlen_q is not None):
                     mdQ_tma_eff = cute.domain_offset(
                         block_offset_dQ,
                         mdQ_tma,

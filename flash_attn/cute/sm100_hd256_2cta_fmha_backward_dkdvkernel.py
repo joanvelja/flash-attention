@@ -1290,7 +1290,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             tma_atom_dOT,
                             blk_offset,
                             problem_shape_cur_batch,
-                            varlen,
+                            cumulative_s_q is not None,
                             iter_count,
                             iter_start,
                             iter_end,
@@ -1658,7 +1658,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     tma_atom_dOT,
                     blk_offset,
                     problem_shape_cur_batch,
-                    varlen,
+                    cumulative_s_q is not None,
                     iter_count,
                     iter_start,
                     iter_end,
@@ -1854,7 +1854,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tma_atom_dOT: cute.CopyAtom,
         blk_offset: cute.Shape,
         problem_shape: tuple[Int32, Int32, Int32, tuple[tuple[Int32, Int32], Int32]],
-        varlen: bool,
+        varlen_q: bool,
         iter_count: Int32,
         iter_start: Int32,
         iter_end: Int32,
@@ -1894,7 +1894,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dO = cute.domain_offset(cute.select(blk_offset, mode=[0, 2, 3]), dO_in)
         dOT = cute.domain_offset(cute.select(blk_offset, mode=[2, 0, 3]), dOT_in)
         blk_offset_stats = blk_offset
-        if cutlass.const_expr(varlen):
+        if cutlass.const_expr(varlen_q):
             cuseqlen_q_stats = cute.assume(
                 (blk_offset[0] + blk_coord_b * self.tile_shape_Q)
                 // self.tile_shape_Q

@@ -4847,3 +4847,59 @@ def test_flash_attn_ragged_tensormap_workspace_padding(packed_kv, seqlen_q, num_
             torch.testing.assert_close(out[i, :ql], ref, atol=0.02, rtol=0.02)
         # Change the sequence ends between calls: descriptors must be rebuilt per call.
         seqused_k = torch.roll(seqused_k, 1)
+
+
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110) or HD256_GENERIC_BWD,
+    reason="Dedicated SM100/SM110 hd256 backward",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("packed_q", [False, True], ids=["dense-q-packed-k", "packed-q-dense-k"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_backward_mixed_storage(dtype, causal, packed_q):
+    """Packing K alone must not require a packed-Q output offset."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 257, 16, 256, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(2, 259, 2, 256, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    q_mask = k_mask = None
+    cu_q = cu_k = None
+    if packed_q:
+        q_mask = torch.arange(257, device="cuda")[None, :] < torch.tensor(
+            [257, 131], device="cuda"
+        )[:, None]
+        q_input, k_input, v_input = torch.cat((q[0], q[1, :131])), k, v
+        cu_q = torch.tensor([0, 257, 388], device="cuda", dtype=torch.int32)
+    else:
+        k_mask = torch.arange(259, device="cuda")[None, :] < torch.tensor(
+            [259, 131], device="cuda"
+        )[:, None]
+        q_input = q
+        k_input, v_input = torch.cat((k[0], k[1, :131])), torch.cat((v[0], v[1, :131]))
+        cu_k = torch.tensor([0, 259, 390], device="cuda", dtype=torch.int32)
+    out, _ = flash_attn_varlen_func(
+        q_input, k_input, v_input, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+        max_seqlen_q=257, max_seqlen_k=259, causal=causal,
+    )
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    if is_fake_mode():
+        return
+
+    q_ref, k_ref, v_ref = [x.detach().float().requires_grad_() for x in (q, k, v)]
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, q_mask, k_mask, causal=causal)
+    out_pt, _ = attention_ref(
+        q, k, v, q_mask, k_mask, causal=causal, upcast=False, reorder_ops=True,
+    )
+    if packed_q:
+        out_ref = torch.cat((out_ref[0], out_ref[1, :131]))
+        out_pt = torch.cat((out_pt[0], out_pt[1, :131]))
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout.float())
+    grads_pt = torch.autograd.grad(out_pt, (q, k, v), dout)
+    for name, actual, reference, baseline in zip(
+        ("out", "dQ", "dK", "dV"), (out, *grads),
+        (out_ref, *grads_ref), (out_pt, *grads_pt),
+    ):
+        assert actual.isfinite().all(), name
+        check_tensor_vs_ref(name, actual, reference, baseline)
