@@ -171,9 +171,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         seqused_k: Optional[cute.Tensor],
         scale_softmax: cutlass.Float32,
         max_seqlen_q: Optional[Int32],
+        tensormap_workspace: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
+        self.ragged_q_tma = cum_seqlen_q is not None or seqused_q is not None
+        self.ragged_kv_tma = cum_seqlen_k is not None or seqused_k is not None
+        self.ragged_tma = self.ragged_q_tma or self.ragged_kv_tma
+        if cutlass.const_expr(self.ragged_tma):
+            assert tensormap_workspace is not None
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
         s_q = q_tensor.shape[1]
         s_k = k_tensor.shape[1]
@@ -554,6 +560,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             qk_tiled_mma,
             dov_tiled_mma,
             dsk_tiled_mma,
+            (q, do, k, v, kt),
+            tensormap_workspace,
             tma_atom_q,
             tma_tensor_q,
             tma_atom_k,
@@ -602,6 +610,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         qk_tiled_mma: cute.TiledMma,
         dov_tiled_mma: cute.TiledMma,
         dsk_tiled_mma: cute.TiledMma,
+        input_gmem: tuple,
+        tensormap_workspace: Optional[cute.Tensor],
         tma_atom_q: cute.CopyAtom,
         mQ_qdl: cute.Tensor,
         tma_atom_k: cute.CopyAtom,
@@ -947,6 +957,47 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
+            tensormap_manager = None
+            tensormap_gmem = ()
+            tensormap_atoms = ()
+            desc_ptrs = (None,) * 5
+            descriptor_tensors = (
+                input_gmem[0] if self.ragged_q_tma else None,
+                input_gmem[1] if self.ragged_q_tma else None,
+                input_gmem[2] if self.ragged_kv_tma else None,
+                input_gmem[3] if self.ragged_kv_tma else None,
+                input_gmem[4] if self.ragged_kv_tma else None,
+            )
+            if cutlass.const_expr(self.ragged_tma):
+                tensormap_manager = utils.TensorMapManager(utils.TensorMapUpdateMode.GMEM, 128)
+                bidx, bidy, bidz = cute.arch.block_idx()
+                gdx, gdy, _ = cute.arch.grid_dim()
+                cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
+                if cta_linear_idx >= cute.size(tensormap_workspace, mode=[0]):
+                    cute.arch.inline_ptx("trap;", read_only_args=[])
+                all_atoms = (tma_atom_q, tma_atom_do, tma_atom_k, tma_atom_v, tma_atom_kt)
+                all_ptrs = tuple(
+                    tensormap_manager.get_tensormap_ptr(
+                        tensormap_workspace[(cta_linear_idx, i, None)].iterator
+                    )
+                    if cutlass.const_expr(t is not None)
+                    else None
+                    for i, t in enumerate(descriptor_tensors)
+                )
+                desc_ptrs = tuple(
+                    tensormap_manager.get_tensormap_ptr(p, cute.AddressSpace.generic)
+                    if cutlass.const_expr(p is not None)
+                    else None
+                    for p in all_ptrs
+                )
+                tensormap_atoms = tuple(
+                    a for a, t in zip(all_atoms, descriptor_tensors) if t is not None
+                )
+                tensormap_gmem = tuple(p for p in all_ptrs if p is not None)
+                for atom, ptr in zip(tensormap_atoms, tensormap_gmem):
+                    tensormap_manager.init_tensormap_from_atom(atom, ptr, self.load_warp_id)
+                tensormap_manager.fence_tensormap_initialization()
+
             while work_tile.is_valid_tile:
                 curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
                 mma_block_coord = (
@@ -994,6 +1045,42 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 has_work = is_valid_q and is_valid_k
 
                 if has_work:
+                    if cutlass.const_expr(
+                        self.ragged_tma and (self.use_clc_scheduler or self.is_persistent)
+                    ):
+                        # A descriptor can be rewritten only after all prior TMA readers finish.
+                        # Drain cloned producer state so the next-use phase/index is unchanged.
+                        load_q_producer.clone().tail()
+                        load_do_producer.clone().tail()
+                        load_k_producer.clone().tail()
+                        load_v_producer.clone().tail()
+                        load_kt_producer.clone().tail()
+                    if cutlass.const_expr(self.ragged_tma):
+                        q_rows_end = cutlass.max(cuseqlen_q + seqlen_q, 1)
+                        k_rows_end = cutlass.max(cuseqlen_k + seqlen_k, 1)
+                        bounded = []
+                        for i, (t, rows_mode) in enumerate(
+                            zip(descriptor_tensors, (0, 0, 0, 0, 1))
+                        ):
+                            if cutlass.const_expr(t is not None):
+                                shape = list(t.shape)
+                                shape[rows_mode] = (
+                                    q_rows_end if cutlass.const_expr(i in (0, 1)) else k_rows_end
+                                )
+                                bounded.append(
+                                    cute.make_tensor(
+                                        t.iterator, cute.make_layout(tuple(shape), stride=t.stride)
+                                    )
+                                )
+                        tensormap_manager.update_tensormap(
+                            tuple(bounded),
+                            tensormap_atoms,
+                            tensormap_gmem,
+                            self.load_warp_id,
+                            (None,) * len(tensormap_atoms),
+                        )
+                        for ptr in tensormap_gmem:
+                            tensormap_manager.fence_tensormap_update(ptr)
                     block_offset = (
                         cuseqlen_q,
                         cuseqlen_k,
@@ -1173,6 +1260,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             tQgQ[None, iter],
                             tQsQ[None, q_handle.index],
                             tma_bar_ptr=q_handle.barrier,
+                            **(
+                                {"tma_desc_ptr": desc_ptrs[0]}
+                                if cutlass.const_expr(self.ragged_q_tma)
+                                else {}
+                            ),
                         )
                     # dO
                     for iter in cutlass.range(self.iterations_dov, unroll=1):
@@ -1182,6 +1274,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             tdOgdO[None, iter],
                             tdOsdO[None, do_handle.index],
                             tma_bar_ptr=do_handle.barrier,
+                            **(
+                                {"tma_desc_ptr": desc_ptrs[1]}
+                                if cutlass.const_expr(self.ragged_q_tma)
+                                else {}
+                            ),
                         )
 
                     kv_coord = seqlen_kv_loop_start
@@ -1194,6 +1291,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 tKgK[None, kv_coord, iter],
                                 tKsK[None, k_handle.index],
                                 tma_bar_ptr=k_handle.barrier,
+                                **(
+                                    {"tma_desc_ptr": desc_ptrs[2]}
+                                    if cutlass.const_expr(self.ragged_kv_tma)
+                                    else {}
+                                ),
                             )
                         # Vi
                         for iter in cutlass.range(self.iterations_dov, unroll=1):
@@ -1203,6 +1305,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 tVgV[None, kv_coord, iter],
                                 tVsV[None, v_handle.index],
                                 tma_bar_ptr=v_handle.barrier,
+                                **(
+                                    {"tma_desc_ptr": desc_ptrs[3]}
+                                    if cutlass.const_expr(self.ragged_kv_tma)
+                                    else {}
+                                ),
                             )
                         # KTi
                         for iter in cutlass.range(self.iterations_dsk, unroll=1):
@@ -1212,6 +1319,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 tKTgKT[None, iter, kv_coord],
                                 tKTsKT[None, kt_handle.index],
                                 tma_bar_ptr=kt_handle.barrier,
+                                **(
+                                    {"tma_desc_ptr": desc_ptrs[4]}
+                                    if cutlass.const_expr(self.ragged_kv_tma)
+                                    else {}
+                                ),
                             )
                         kv_coord += 1
 

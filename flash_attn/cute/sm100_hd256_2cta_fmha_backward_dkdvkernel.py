@@ -221,10 +221,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         seqused_k: cute.Tensor | None,
         scale_softmax: cutlass.Float32,
         max_seqlen_k: Int32 | None,
+        tensormap_workspace: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
         """Host function to launch CuTeDSL kernel."""
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
+        self.ragged_q_tma = cumulative_s_q is not None or seqused_q is not None
+        self.ragged_kv_tma = cumulative_s_k is not None or seqused_k is not None
+        self.ragged_tma = self.ragged_q_tma or self.ragged_kv_tma
+        if cutlass.const_expr(self.ragged_tma):
+            assert tensormap_workspace is not None
         self.use_varlen_scheduler = cumulative_s_k is not None and max_seqlen_k is None
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
         h_r = Q.shape[3]
@@ -765,6 +771,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
 
         self.dkdv_bwd(
+            (K, V, Q, QT, dO, dOT),
+            tensormap_workspace,
             KQ_tiled_mma,
             VdO_tiled_mma,
             PdO_tiled_mma,
@@ -824,6 +832,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
     @cute.kernel
     def dkdv_bwd(
         self,
+        input_gmem: tuple,
+        tensormap_workspace: cute.Tensor | None,
         KQ_tiled_mma: cute.TiledMma,
         VdO_tiled_mma: cute.TiledMma,
         PdO_tiled_mma: cute.TiledMma,
@@ -1162,6 +1172,48 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # tdVtdV shape : (MMA, MMA_M, MMA_N)
         tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_dV_offset, tdVtdV.layout)
 
+        tensormap_manager = None
+        tensormap_gmem = ()
+        tensormap_atoms = ()
+        desc_ptrs = (None,) * 6
+        descriptor_tensors = (
+            input_gmem[0] if self.ragged_kv_tma else None,
+            input_gmem[1] if self.ragged_kv_tma else None,
+            input_gmem[2] if self.ragged_q_tma else None,
+            input_gmem[3] if self.ragged_q_tma else None,
+            input_gmem[4] if self.ragged_q_tma else None,
+            input_gmem[5] if self.ragged_q_tma else None,
+        )
+        if cutlass.const_expr(self.ragged_tma):
+            tensormap_manager = utils.TensorMapManager(utils.TensorMapUpdateMode.GMEM, 128)
+            bidx, bidy, bidz = cute.arch.block_idx()
+            gdx, gdy, _ = cute.arch.grid_dim()
+            cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
+            if cta_linear_idx >= cute.size(tensormap_workspace, mode=[0]):
+                cute.arch.inline_ptx("trap;", read_only_args=[])
+            all_atoms = (tma_atom_K, tma_atom_V, tma_atom_Q, tma_atom_QT, tma_atom_dO, tma_atom_dOT)
+            all_ptrs = tuple(
+                tensormap_manager.get_tensormap_ptr(
+                    tensormap_workspace[(cta_linear_idx, i, None)].iterator
+                )
+                if cutlass.const_expr(t is not None)
+                else None
+                for i, t in enumerate(descriptor_tensors)
+            )
+            desc_ptrs = tuple(
+                tensormap_manager.get_tensormap_ptr(p, cute.AddressSpace.generic)
+                if cutlass.const_expr(p is not None)
+                else None
+                for p in all_ptrs
+            )
+            tensormap_atoms = tuple(
+                a for a, t in zip(all_atoms, descriptor_tensors) if t is not None
+            )
+            tensormap_gmem = tuple(p for p in all_ptrs if p is not None)
+            for atom, ptr in zip(tensormap_atoms, tensormap_gmem):
+                tensormap_manager.init_tensormap_from_atom(atom, ptr, self.load_warp_id)
+            tensormap_manager.fence_tensormap_initialization()
+
         # get the current batch problem shape
 
         if cutlass.const_expr(self.use_clc_scheduler):
@@ -1262,6 +1314,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             load_compute_sum_OdO_producer,
                             load_mma_QT_producer,
                         ) = self.load(
+                            descriptor_tensors,
+                            tensormap_atoms,
+                            tensormap_gmem,
+                            desc_ptrs,
                             K_in,
                             V_in,
                             Q_in,
@@ -1630,6 +1686,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
 
                 self.load(
+                    descriptor_tensors,
+                    tensormap_atoms,
+                    tensormap_gmem,
+                    desc_ptrs,
                     K_in,
                     V_in,
                     Q_in,
@@ -1826,6 +1886,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
     @cute.jit
     def load(
         self,
+        descriptor_tensors: tuple,
+        tensormap_atoms: tuple,
+        tensormap_gmem: tuple,
+        desc_ptrs: tuple,
         K_in: cute.Tensor,
         V_in: cute.Tensor,
         Q_in: cute.Tensor,
@@ -1886,6 +1950,41 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # MMA/TMA use physical CTA rank, not the flat tile index.
         mma_tile_coord_v = cute.arch.block_idx_in_cluster() % cute.size(KQ_tiled_mma.thr_id.shape)
         mma_tile_coord_m = blk_coord_k // cute.size(KQ_tiled_mma.thr_id.shape)
+
+        if cutlass.const_expr(self.ragged_tma and self.use_clc_scheduler):
+            # CLC reuses descriptor slots across owners; wait for old TMA readers.
+            # tail() advances its state, hence the clones.
+            load_mma_K_producer.clone().tail()
+            load_mma_V_producer.clone().tail()
+            load_mma_Q_producer.clone().tail()
+            load_mma_QT_producer.clone().tail()
+            load_mma_dO_producer.clone().tail()
+            load_mma_dOT_producer.clone().tail()
+        if cutlass.const_expr(self.ragged_tma):
+            q_rows_end = cutlass.max(blk_offset[0] + problem_shape[0], 1)
+            k_rows_end = cutlass.max(blk_offset[1] + problem_shape[1], 1)
+            bounded = []
+            for i, (t, rows_mode) in enumerate(zip(descriptor_tensors, (0, 0, 0, 1, 0, 1))):
+                if cutlass.const_expr(t is not None):
+                    shape = list(t.shape)
+                    shape[rows_mode] = (
+                        q_rows_end if cutlass.const_expr(i in (2, 3, 4, 5)) else k_rows_end
+                    )
+                    bounded.append(
+                        cute.make_tensor(
+                            t.iterator, cute.make_layout(tuple(shape), stride=t.stride)
+                        )
+                    )
+            tensormap_manager = utils.TensorMapManager(utils.TensorMapUpdateMode.GMEM, 128)
+            tensormap_manager.update_tensormap(
+                tuple(bounded),
+                tensormap_atoms,
+                tensormap_gmem,
+                self.load_warp_id,
+                (None,) * len(tensormap_atoms),
+            )
+            for ptr in tensormap_gmem:
+                tensormap_manager.fence_tensormap_update(ptr)
 
         K = cute.domain_offset(cute.select(blk_offset, mode=[1, 2, 3]), K_in)
         V = cute.domain_offset(cute.select(blk_offset, mode=[1, 2, 3]), V_in)
@@ -1984,6 +2083,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tKgK_mkl[(None, mma_tile_coord_m, 0, (blk_coord_h, blk_coord_b))],
             tKsK[None, 0],
             tma_bar_ptr=k_handle.barrier,
+            **({"tma_desc_ptr": desc_ptrs[0]} if cutlass.const_expr(self.ragged_kv_tma) else {}),
         )
 
         q_handle = load_mma_Q_producer.acquire_and_advance()
@@ -1992,6 +2092,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tQgQ_mkl[(None, iter_index, 0, (blk_coord_h, blk_coord_b))],
             tQsQ[None, q_handle.index],
             tma_bar_ptr=q_handle.barrier,
+            **({"tma_desc_ptr": desc_ptrs[2]} if cutlass.const_expr(self.ragged_q_tma) else {}),
         )
 
         lse_handle = load_compute_LSE_producer.acquire_and_advance()
@@ -2025,6 +2126,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tVgV_mkl[(None, mma_tile_coord_m, 0, (blk_coord_h, blk_coord_b))],
             tVsV[(None, 0)],
             tma_bar_ptr=v_handle.barrier,
+            **({"tma_desc_ptr": desc_ptrs[1]} if cutlass.const_expr(self.ragged_kv_tma) else {}),
         )
 
         do_handle = load_mma_dO_producer.acquire_and_advance()
@@ -2033,6 +2135,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tdOgdO_mkl[(None, iter_index, 0, (blk_coord_h, blk_coord_b))],
             tdOsdO[(None, do_handle.index)],
             tma_bar_ptr=do_handle.barrier,
+            **({"tma_desc_ptr": desc_ptrs[4]} if cutlass.const_expr(self.ragged_q_tma) else {}),
         )
 
         sum_odo_handle = load_compute_sum_OdO_producer.acquire_and_advance()
@@ -2057,6 +2160,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
             tdOTsdOT[None, dot_handle.index],
             tma_bar_ptr=dot_handle.barrier,
+            **({"tma_desc_ptr": desc_ptrs[5]} if cutlass.const_expr(self.ragged_q_tma) else {}),
         )
 
         qt_handle = load_mma_QT_producer.acquire_and_advance()
@@ -2065,6 +2169,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tQTgQT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
             tQTsQT[None, qt_handle.index],
             tma_bar_ptr=qt_handle.barrier,
+            **({"tma_desc_ptr": desc_ptrs[3]} if cutlass.const_expr(self.ragged_q_tma) else {}),
         )
 
         iter_count -= 1
@@ -2082,6 +2187,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tQgQ_mkl[(None, iter_index, 0, (blk_coord_h, blk_coord_b))],
                 tQsQ[None, q_handle.index],
                 tma_bar_ptr=q_handle.barrier,
+                **({"tma_desc_ptr": desc_ptrs[2]} if cutlass.const_expr(self.ragged_q_tma) else {}),
             )
 
             lse_handle = load_compute_LSE_producer.acquire_and_advance()
@@ -2106,6 +2212,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tdOgdO_mkl[(None, iter_index, 0, (blk_coord_h, blk_coord_b))],
                 tdOsdO[None, do_handle.index],
                 tma_bar_ptr=do_handle.barrier,
+                **({"tma_desc_ptr": desc_ptrs[4]} if cutlass.const_expr(self.ragged_q_tma) else {}),
             )
 
             sum_odo_handle = load_compute_sum_OdO_producer.acquire_and_advance()
@@ -2132,6 +2239,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tdOTgdOT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
                 tdOTsdOT[None, dot_handle.index],
                 tma_bar_ptr=dot_handle.barrier,
+                **({"tma_desc_ptr": desc_ptrs[5]} if cutlass.const_expr(self.ragged_q_tma) else {}),
             )
 
             qt_handle = load_mma_QT_producer.acquire_and_advance()
@@ -2140,6 +2248,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 tQTgQT_mkl[(None, 0, iter_index, (blk_coord_h, blk_coord_b))],
                 tQTsQT[None, qt_handle.index],
                 tma_bar_ptr=qt_handle.barrier,
+                **({"tma_desc_ptr": desc_ptrs[3]} if cutlass.const_expr(self.ragged_q_tma) else {}),
             )
 
             iter_count -= 1

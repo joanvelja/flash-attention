@@ -2375,6 +2375,21 @@ def _flash_attn_bwd(
         )
         n_desc = 3 if arch // 10 in [10, 11] else 2
         bwd_tensormap_workspace = torch.empty((n_ctas, n_desc, 16), dtype=torch.int64, device=device)
+    if use_dedicated_hd256_kernel and is_varlen:
+        # The two dedicated kernels reuse this workspace sequentially. Their physical
+        # grids differ: dQ has 128 query rows/CTA and dK/dV has 64 key rows/CTA.
+        # Both pad every batch to a CTA pair, including CLC's launch grid.
+        if cu_seqlens_q is not None and max_seqlen_q is None:
+            q_ctas = (total_q // 128 + 2 * batch_size + 1) * num_head
+        else:
+            q_ctas = ((seqlen_q + 255) // 256 * 2) * batch_size * num_head
+        if cu_seqlens_k is not None and max_seqlen_k is None:
+            kv_ctas = (total_k // 64 + 2 * batch_size + 1) * num_head_kv
+        else:
+            kv_ctas = ((seqlen_k + 127) // 128 * 2) * batch_size * num_head_kv
+        bwd_tensormap_workspace = torch.empty(
+            (max(q_ctas, kv_ctas), 6, 16), dtype=torch.int64, device=device
+        )
     compile_key = compile_key + (bwd_tensormap_workspace is not None,)
     compiled_bwd = _flash_attn_bwd.compile_cache.get(compile_key)
     if compiled_bwd is None:
@@ -2560,6 +2575,9 @@ def _flash_attn_bwd(
                     Int32(max_seqlen_k)
                     if cu_seqlens_k is not None and max_seqlen_k is not None
                     else None,
+                    to_cute_tensor(bwd_tensormap_workspace, assumed_align=128, leading_dim=2)
+                    if bwd_tensormap_workspace is not None
+                    else None,
                 )
             )
         compile_args.append(current_stream)
@@ -2616,6 +2634,7 @@ def _flash_attn_bwd(
                     max_seqlen_k
                     if cu_seqlens_k is not None
                     else None,
+                    bwd_tensormap_workspace,
                 )
             )
         compiled_bwd(*call_args)

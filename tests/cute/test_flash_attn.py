@@ -4847,3 +4847,202 @@ def test_flash_attn_ragged_tensormap_workspace_padding(packed_kv, seqlen_q, num_
             torch.testing.assert_close(out[i, :ql], ref, atol=0.02, rtol=0.02)
         # Change the sequence ends between calls: descriptors must be rebuilt per call.
         seqused_k = torch.roll(seqused_k, 1)
+
+
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110) or HD256_GENERIC_BWD,
+    reason="Dedicated SM100/SM110 hd256 backward tail isolation",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("varlen", [False, True], ids=["dense", "packed"])
+@pytest.mark.parametrize("operand", ["q", "dout", "k", "v"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_backward_unused_tail(dtype, varlen, operand):
+    """One unused Q/dO/K/V tail must not contaminate any used gradient row."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 257, 16, 256, device="cuda", dtype=dtype)
+    k = torch.randn(2, 259, 2, 256, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    dout = torch.randn_like(q)
+    used_q = torch.tensor([0, 129], device="cuda", dtype=torch.int32)
+    used_k = torch.tensor([127, 193], device="cuda", dtype=torch.int32)
+    q_valid = torch.arange(257, device="cuda")[None, :] < used_q[:, None]
+    k_valid = torch.arange(259, device="cuda")[None, :] < used_k[:, None]
+    for tensor, valid in ((q, q_valid), (dout, q_valid), (k, k_valid), (v, k_valid)):
+        tensor.masked_fill_(~valid[..., None, None], 0)
+    if varlen:
+        q, k, v, dout = [t.flatten(0, 1) for t in (q, k, v, dout)]
+        q_valid, k_valid = q_valid.flatten(), k_valid.flatten()
+    kwargs = dict(
+        causal=True, seqused_q=used_q, seqused_k=used_k,
+        cu_seqlens_q=torch.tensor([0, 257, 514], device="cuda", dtype=torch.int32) if varlen else None,
+        cu_seqlens_k=torch.tensor([0, 259, 518], device="cuda", dtype=torch.int32) if varlen else None,
+        max_seqlen_q=257, max_seqlen_k=259,
+    )
+    out, lse, *_ = _flash_attn_fwd(q, k, v, return_lse=True, **kwargs)
+    reference = _flash_attn_bwd(q, k, v, out, dout, lse, **kwargs)
+    inputs = dict(q=q, k=k, v=v, dout=dout)
+    mask = q_valid if operand in ("q", "dout") else k_valid
+    inputs[operand] = inputs[operand].masked_fill(~mask[..., None, None], float("nan"))
+    actual = _flash_attn_bwd(
+        inputs["q"], inputs["k"], inputs["v"], out, inputs["dout"], lse, **kwargs
+    )
+    if is_fake_mode():
+        return
+    for name, got, want in zip(("dQ", "dK", "dV"), actual, reference):
+        valid = q_valid if name == "dQ" else k_valid
+        got, want = got[valid], want[valid]
+        assert want.isfinite().all(), f"clean {name} has NaN/Inf"
+        assert got.isfinite().all(), f"{operand}: {name} has NaN/Inf"
+        # The dedicated kernel reduces GQA heads within one owner, without atomics.
+        assert torch.equal(got, want), f"{operand}: used {name} changed"
+
+
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110) or HD256_GENERIC_BWD,
+    reason="Dedicated SM100/SM110 hd256 backward descriptors",
+)
+@pytest.mark.parametrize(
+    "layout_mode,use_clc",
+    [("dense", False), ("dense", True), ("flat", False), ("skewed", False), ("skewed", True)],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_backward_tensormap_workspace(monkeypatch, layout_mode, use_clc):
+    """Both dedicated grids must fit, including each sequence's padded CTA pair."""
+    from functools import partial
+    from flash_attn.cute import interface
+
+    monkeypatch.setattr(
+        interface, "BlackwellFusedMultiHeadAttentionBackward",
+        partial(interface.BlackwellFusedMultiHeadAttentionBackward, use_clc_scheduler=use_clc),
+    )
+    # CLC is a constructor knob rather than a public API cache-key field.
+    # Separate persistent namespaces compile both variants and retain two-pass reuse.
+    from flash_attn.cute.cache_utils import get_jit_cache
+    monkeypatch.setattr(
+        _flash_attn_bwd, "compile_cache",
+        get_jit_cache(f"hd256_workspace_clc_{int(use_clc)}"),
+    )
+    torch.manual_seed(0)
+    batch, nheads, d = 49, 2, 256
+    lengths = [4097] + [1] * (batch - 1) if layout_mode == "skewed" else [129] * batch
+    used = [lengths[0]] + [0, 1, 65, 129] * 12 if layout_mode != "skewed" else lengths
+    used_t = torch.tensor(used, device="cuda", dtype=torch.int32)
+    dtype = torch.bfloat16
+    cu = torch.tensor([0] + list(itertools.accumulate(lengths)), device="cuda", dtype=torch.int32)
+    q = torch.randn(sum(lengths), nheads, d, device="cuda", dtype=dtype)
+    k, v, dout = [torch.randn_like(q) for _ in range(3)]
+    valid = torch.cat([
+        torch.arange(capacity, device="cuda") < count
+        for capacity, count in zip(lengths, used)
+    ])
+    for tensor in (q, k, v, dout):
+        tensor.masked_fill_(~valid[:, None, None], 0)
+    if layout_mode == "dense":
+        q, k, v, dout = [t.view(batch, lengths[0], nheads, d) for t in (q, k, v, dout)]
+        valid = valid.view(batch, lengths[0])
+    kwargs = dict(
+        causal=True, seqused_q=used_t, seqused_k=used_t,
+        cu_seqlens_q=cu if layout_mode != "dense" else None,
+        cu_seqlens_k=cu if layout_mode != "dense" else None,
+        max_seqlen_q=None if layout_mode == "flat" else max(lengths),
+        max_seqlen_k=None if layout_mode == "flat" else max(lengths),
+    )
+    out, lse, *_ = _flash_attn_fwd(q, k, v, return_lse=True, **kwargs)
+    reference = _flash_attn_bwd(q, k, v, out, dout, lse, **kwargs)
+    poisoned = [t.masked_fill(~valid[..., None, None], float("nan")) for t in (q, k, v, dout)]
+    actual = _flash_attn_bwd(*poisoned[:3], out, poisoned[3], lse, **kwargs)
+    if is_fake_mode():
+        return
+    for name, got, want in zip(("dQ", "dK", "dV"), actual, reference):
+        assert want[valid].isfinite().all(), f"clean {name} has NaN/Inf"
+        assert got[valid].isfinite().all(), f"{name} has NaN/Inf"
+        assert torch.equal(got[valid], want[valid]), f"used {name} changed"
+
+
+_HD256_BACKWARD_BOUNDARY_SCRIPT = r"""
+import sys
+import torch
+from cuda.bindings import driver as cu
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+
+def check(result):
+    error, *values = result
+    assert error == cu.CUresult.CUDA_SUCCESS, result
+    return values[0] if len(values) == 1 else values
+
+torch.manual_seed(0)
+torch.cuda.init()
+operand = sys.argv[1]
+lengths, heads, dim = [1, 65], 1, 256
+inputs = {name: torch.randn(sum(lengths), heads, dim, device="cuda", dtype=torch.bfloat16)
+          for name in ("q", "k", "v", "dout")}
+cu_seq = torch.tensor([0, 1, 66], device="cuda", dtype=torch.int32)
+kwargs = dict(cu_seqlens_q=cu_seq, cu_seqlens_k=cu_seq,
+              max_seqlen_q=65, max_seqlen_k=65, causal=True)
+out, lse, *_ = _flash_attn_fwd(inputs["q"], inputs["k"], inputs["v"], return_lse=True, **kwargs)
+reference = _flash_attn_bwd(inputs["q"], inputs["k"], inputs["v"], out, inputs["dout"], lse, **kwargs)
+
+dev = torch.cuda.current_device()
+prop = cu.CUmemAllocationProp()
+prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+prop.location.id = dev
+gran = check(cu.cuMemGetAllocationGranularity(
+    prop, cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM))
+size, guard = gran, 4 * gran
+va = check(cu.cuMemAddressReserve(size + guard, 0, 0, 0))
+handle = check(cu.cuMemCreate(size, prop, 0))
+check(cu.cuMemMap(va, size, 0, handle, 0))
+access = cu.CUmemAccessDesc()
+access.location.type, access.location.id = prop.location.type, dev
+access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+check(cu.cuMemSetAccess(va, size, [access], 1))
+storage = torch._C._construct_storage_from_data_pointer(int(va), torch.device("cuda", dev), size)
+mapped = torch.empty(0, dtype=torch.bfloat16, device="cuda").set_(storage).view(size // 2)
+n = inputs[operand].numel()
+assert n * 2 <= size
+bounded = mapped[-n:].view_as(inputs[operand]).copy_(inputs[operand])
+assert bounded.data_ptr() + n * 2 == int(va) + size
+inputs[operand] = bounded
+actual = _flash_attn_bwd(inputs["q"], inputs["k"], inputs["v"], out, inputs["dout"], lse, **kwargs)
+torch.cuda.synchronize()
+for name, got, want in zip(("dQ", "dK", "dV"), actual, reference):
+    assert got.isfinite().all(), name
+    assert torch.equal(got, want), name
+print("ok")
+"""
+
+
+@pytest.mark.skipif(
+    not (IS_SM100 or IS_SM110) or HD256_GENERIC_BWD,
+    reason="Dedicated SM100/SM110 hd256 backward descriptors",
+)
+@pytest.mark.parametrize("operand", ["q", "dout", "k", "v"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_backward_tma_allocation_boundary(operand):
+    """Descriptor rebinding must not let TMA prefetch beyond the last mapped row."""
+    import subprocess
+    import sys
+
+    q = torch.randn(66, 1, 256, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    cu = torch.tensor([0, 1, 66], device="cuda", dtype=torch.int32)
+    kwargs = dict(cu_seqlens_q=cu, cu_seqlens_k=cu,
+                  max_seqlen_q=65, max_seqlen_k=65, causal=True)
+    out, lse, *_ = _flash_attn_fwd(q, k, v, return_lse=True, **kwargs)
+    _flash_attn_bwd(q, k, v, out, torch.randn_like(out), lse, **kwargs)
+    if is_fake_mode():
+        return
+    pytest.importorskip("cuda.bindings")
+    if not hasattr(torch._C, "_construct_storage_from_data_pointer"):
+        pytest.skip("needs torch._C._construct_storage_from_data_pointer")
+    env = dict(os.environ)
+    env.pop("FLASH_ATTENTION_FAKE_TENSOR", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _HD256_BACKWARD_BOUNDARY_SCRIPT, operand],
+        env=env, capture_output=True, text=True, timeout=1800,
+    )
+    assert proc.returncode == 0 and proc.stdout.strip().endswith("ok"), (
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
