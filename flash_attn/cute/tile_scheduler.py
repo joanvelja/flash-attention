@@ -14,7 +14,7 @@ from cutlass.pipeline import PipelineClcFetchAsync, PipelineState
 from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
 from cutlass.cute.typing import Boolean
 from cutlass.cutlass_dsl import (
@@ -139,8 +139,26 @@ class DynamicPersistentSchedulerState(SchedulerState):
         self._work_info[3] = split
 
 
+# NOTE [SM100 forward work coordinates]
+# With C = cta_group_size (2 for 2CTA, else 1), every CTA in a cluster receives the same
+# logical (work_m, head, batch, split) and validity; the CTA rank is not part of work_m.
+# Grids count physical CTAs: physical_x = C * cluster_slot + cta_rank. Persistence can run
+# many logical tiles on one physical cluster, so a work tile id is not a cluster id.
+#
+# The SM100 forward passes logical M work tiles in num_block with use_cluster_idx = (C > 1).
+# SingleTileLPTScheduler's CLC grid has grid_x = num_block * C; clc_work_to_coords divides
+# claimed_x by C and optionally reverses M for LPT. StaticPersistentTileScheduler takes
+# num_block as a cluster count, caps the grid at the SM count rounded down to whole clusters,
+# and strides over work by the launched cluster count. Varlen metadata units and the backward/MLA contracts are
+# separate. Row mapping: NOTE [SM100 forward coordinate spaces] in flash_fwd_sm100.py.
+
+
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
-    """Altered WorkTileInfo which includes four axes: (block, head, batch, split)"""
+    """Altered WorkTileInfo which includes four axes: (block, head, batch, split).
+
+    For the SM100 forward these are logical work coordinates, shared by every CTA of a
+    cluster; see NOTE [SM100 forward work coordinates].
+    """
 
     @override
     def __new_from_mlir_values__(self, values: list[ir.Value]) -> "WorkTileInfo":
@@ -157,6 +175,9 @@ class TileSchedulerProtocol(Protocol):
     Schedulers are responsible for:
     1. Coordinate mapping: linear tile index -> (m_block, head, batch, split)
     2. Work distribution: how to get the next tile (static grid-stride vs dynamic)
+
+    Grids are in physical CTAs, work tiles in logical coordinates; for the SM100 forward
+    see NOTE [SM100 forward work coordinates].
     """
 
     def initial_work_tile_info(self) -> WorkTileInfo:
@@ -189,6 +210,8 @@ class TileSchedulerProtocol(Protocol):
 
 @dataclass
 class TileSchedulerArguments(ParamsBase):
+    # num_block is in logical work tiles with use_cluster_idx, else in CTA tiles; see
+    # NOTE [SM100 forward work coordinates].
     num_block: Int32
     num_head: Int32
     num_batch: Int32
@@ -226,7 +249,7 @@ class SingleTileScheduler:
         num_head: Int32
         num_batch: Int32
         num_splits: Int32
-        num_splits_divmod: FastDivmodDivisor
+        num_splits_divmod: FastDivmodDivisorV2
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         use_cluster_idx: cutlass.Constexpr[bool] = False
@@ -241,7 +264,7 @@ class SingleTileScheduler:
                 args.num_head,
                 args.num_batch,
                 args.num_splits,
-                FastDivmodDivisor(args.num_splits),
+                FastDivmodDivisorV2(args.num_splits),
                 args.is_split_kv,
                 args.cluster_shape_mn,
                 args.use_cluster_idx,
@@ -352,8 +375,8 @@ class SingleTileScheduler:
 class StaticPersistentTileScheduler:
     @dataclass
     class Params(ParamsBase):
-        num_block_cluster_divmod: FastDivmodDivisor
-        num_head_divmod: FastDivmodDivisor
+        num_block_cluster_divmod: FastDivmodDivisorV2
+        num_head_divmod: FastDivmodDivisorV2
         total_blocks_cluster: Int32
         cluster_shape_m: cutlass.Constexpr[int] = 1
 
@@ -361,11 +384,16 @@ class StaticPersistentTileScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "StaticPersistentTileScheduler.Params":
-            num_block_cluster = cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
+            # use_cluster_idx: num_block already counts clusters (NOTE [SM100 forward work coordinates]).
+            num_block_cluster = (
+                args.num_block
+                if const_expr(args.use_cluster_idx)
+                else cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
+            )
             total_blocks_cluster = num_block_cluster * args.num_head * args.num_batch
             return StaticPersistentTileScheduler.Params(
-                FastDivmodDivisor(num_block_cluster),
-                FastDivmodDivisor(args.num_head),
+                FastDivmodDivisorV2(num_block_cluster),
+                FastDivmodDivisorV2(args.num_head),
                 total_blocks_cluster,
                 cluster_shape_m=args.cluster_shape_mn[0],
             )
@@ -464,12 +492,12 @@ class SingleTileLPTScheduler:
         num_head: Int32
         num_batch: Int32
         l2_minor: Int32
-        num_head_divmod: FastDivmodDivisor
-        l2_minor_divmod: FastDivmodDivisor
-        l2_major_divmod: FastDivmodDivisor
-        l2_minor_residual_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisorV2
+        l2_minor_divmod: FastDivmodDivisorV2
+        l2_major_divmod: FastDivmodDivisorV2
+        l2_minor_residual_divmod: FastDivmodDivisorV2
         num_hb_quotient: Int32
-        num_splits_divmod: FastDivmodDivisor
+        num_splits_divmod: FastDivmodDivisorV2
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
@@ -514,13 +542,13 @@ class SingleTileLPTScheduler:
                 num_head=args.num_head,
                 num_batch=args.num_batch,
                 l2_minor=Int32(swizzle),
-                num_head_divmod=FastDivmodDivisor(args.num_head),
-                l2_minor_divmod=FastDivmodDivisor(swizzle),
-                l2_major_divmod=FastDivmodDivisor(swizzle * args.num_block),
-                l2_minor_residual_divmod=FastDivmodDivisor(max(num_hb_remainder, 1)),
+                num_head_divmod=FastDivmodDivisorV2(args.num_head),
+                l2_minor_divmod=FastDivmodDivisorV2(swizzle),
+                l2_major_divmod=FastDivmodDivisorV2(swizzle * args.num_block),
+                l2_minor_residual_divmod=FastDivmodDivisorV2(max(num_hb_remainder, 1)),
                 num_hb_quotient=Int32(num_hb_quotient),
                 num_splits=args.num_splits,
-                num_splits_divmod=FastDivmodDivisor(args.num_splits),
+                num_splits_divmod=FastDivmodDivisorV2(args.num_splits),
                 is_split_kv=args.is_split_kv,
                 cluster_shape_m=args.cluster_shape_mn[0],
                 scheduling_mode=scheduling_mode,
@@ -593,7 +621,11 @@ class SingleTileLPTScheduler:
             return SingleTileLPTScheduler(
                 params, cute.arch.block_idx()[0], Int32(0), ctx, loc=loc, ip=ip
             )
-        tile_idx, split_idx, _ = cute.arch.block_idx()
+        if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
+            # Both CTAs share one m block.
+            tile_idx, split_idx, _ = cute.arch.cluster_idx()
+        else:
+            tile_idx, split_idx, _ = cute.arch.block_idx()
         return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
     @staticmethod
@@ -605,33 +637,34 @@ class SingleTileLPTScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             return SingleTileLPTScheduler._clc_grid_shape(params)
-        return (params.total_blocks, params.num_splits, Int32(1))
+        grid_x = params.total_blocks
+        if const_expr(params.cluster_shape_m > 1 and params.use_cluster_idx):
+            # Convert clusters to CTAs.
+            grid_x = grid_x * params.cluster_shape_m
+        return (grid_x, params.num_splits, Int32(1))
 
     @cute.jit
     def clc_work_to_coords(self, work) -> WorkTileInfo:
         """Convert CLC response (block, head, batch_split) to WorkTileInfo.
 
         CLC returns raw grid coordinates — no L2 swizzle (hardware decides order).
-        We only apply cluster division, optional LPT block reversal, and split_kv unpacking.
+        Clustered grids use one m block per cluster; num_block counts clusters. Both CTAs
+        of a cluster decode the same logical tile; see NOTE [SM100 forward work coordinates].
         """
+        assert self.params.cluster_shape_m == 1 or self.params.use_cluster_idx, (
+            "CLC with clusters requires use_cluster_idx"
+        )
         block_idx = work.tile_idx[0]
         if const_expr(self.params.cluster_shape_m > 1):
             block_idx = block_idx // self.params.cluster_shape_m
         if const_expr(self.params.lpt):
             # Longest-processing-time-first: reverse block order
-            if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-                num_block = self.params.num_block // self.params.cluster_shape_m
-            else:
-                num_block = self.params.num_block
-            block_idx = num_block - 1 - block_idx
+            block_idx = self.params.num_block - 1 - block_idx
         split_idx = Int32(0)
         if const_expr(self.params.is_split_kv):
             batch_idx, split_idx = divmod(work.tile_idx[2], self.params.num_splits_divmod)
         else:
             batch_idx = work.tile_idx[2]
-        if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
-            bidx_in_cluster = cute.arch.block_in_cluster_idx()
-            block_idx = block_idx * self.params.cluster_shape_m + bidx_in_cluster[0]
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
         if const_expr(self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None):
             if work.is_valid_tile:
@@ -729,10 +762,10 @@ class SingleTileLPTBwdScheduler:
         total_blocks: Int32
         num_block: Int32
         l2_minor: Int32
-        num_head_divmod: FastDivmodDivisor
-        l2_minor_divmod: FastDivmodDivisor
-        l2_major_divmod: FastDivmodDivisor
-        l2_minor_residual_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisorV2
+        l2_minor_divmod: FastDivmodDivisorV2
+        l2_major_divmod: FastDivmodDivisorV2
+        l2_minor_residual_divmod: FastDivmodDivisorV2
         num_hb_quotient: Int32
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         spt: cutlass.Constexpr[bool] = True
@@ -767,10 +800,10 @@ class SingleTileLPTBwdScheduler:
                 * args.num_batch,
                 num_block=num_block,
                 l2_minor=Int32(swizzle),
-                num_head_divmod=FastDivmodDivisor(args.num_head),
-                l2_minor_divmod=FastDivmodDivisor(swizzle),
-                l2_major_divmod=FastDivmodDivisor(swizzle * num_block),
-                l2_minor_residual_divmod=FastDivmodDivisor(
+                num_head_divmod=FastDivmodDivisorV2(args.num_head),
+                l2_minor_divmod=FastDivmodDivisorV2(swizzle),
+                l2_major_divmod=FastDivmodDivisorV2(swizzle * num_block),
+                l2_minor_residual_divmod=FastDivmodDivisorV2(
                     max(num_hb_remainder, 1)
                 ),  # don't divide by 0
                 num_hb_quotient=Int32(num_hb_quotient),
@@ -1861,6 +1894,40 @@ def compute_sm100_fmha_grid(
     )
     grid = Sm100FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
     return tile_sched_params, grid
+
+
+def compute_sm100_fmha_varlen_grid(
+    shape: cute.Shape,
+    cu_seqlens: cute.Tensor,
+    tile_shape_mn: Tuple[int, int],
+) -> Tuple[SingleTileVarlenScheduler.Params, Tuple[Int32, Int32, Int32]]:
+    """Build a flat grid with each CTA pair confined to one sequence.
+
+    ``shape`` is (token_capacity, head_dim, ((head_ratio, num_heads), batch)).
+    """
+    args = TileSchedulerArguments(
+        num_block=Int32(0),
+        num_head=cute.size(shape[2][0]),
+        num_batch=cute.size(shape[2][1]),
+        num_splits=Int32(1),
+        seqlen_k=Int32(0),
+        headdim=cute.size(shape[1]),
+        headdim_v=cute.size(shape[1]),
+        total_q=cute.size(shape[0]),
+        tile_shape_mn=tile_shape_mn,
+        cluster_shape_mn=(2, 1),
+        mCuSeqlensQ=cu_seqlens,
+    )
+    params = SingleTileVarlenScheduler.to_underlying_arguments(args)
+    return params, SingleTileVarlenScheduler.get_grid_shape(params)
+
+
+def sm100_fmha_block_coord(work_tile: WorkTileInfo, flat: bool) -> cute.Coord:
+    """Adapt flat-scheduler axes or keep the legacy FMHA coordinate layout."""
+    if not flat:
+        return work_tile.tile_idx
+    block, head, batch, _ = work_tile.tile_idx
+    return block, Int32(0), (head, batch)
 
 
 ##############################################################################
