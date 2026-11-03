@@ -515,7 +515,9 @@ def check_register_record(registers: object, expected: type, kernel: str) -> Non
         raise ValueError(
             f"{kernel} needs registers of type {expected.__name__}, got {type(registers).__name__}"
         )
-    if registers is not None and any(v % 8 != 0 or not 24 <= v <= 256 for v in vars(registers).values()):
+    if registers is not None and any(
+        v % 8 != 0 or not 24 <= v <= 256 for v in vars(registers).values()
+    ):
         raise ValueError(f"Register counts must be multiples of 8 in [24, 256], got {registers}")
 
 
@@ -2248,8 +2250,8 @@ class BwdHeuristicInputs(NamedTuple):
 
     @property
     def uses_dedicated_hd256_kernel(self) -> bool:
-        """SM100 hdim 256 runs the dedicated kernels unless FLASH_ATTENTION_HD256_GENERIC_BWD."""
-        return self.is_hdim256 and not self.hd256_generic
+        """Local hdim-256 attention requires the generic kernel; the env flag also opts in."""
+        return self.is_hdim256 and not self.local and not self.hd256_generic
 
 
 def bwd_sparse_q_block_size(inputs: BwdHeuristicInputs) -> int | None:
@@ -2600,7 +2602,7 @@ def select_bwd_config(inputs: BwdHeuristicInputs) -> BwdConfig:
                 else Sm90BwdRegisters(mma=240, mma_no_dq=240, producer=24)
             )
         case 10 | 11:
-            hd256_generic = inputs.is_hdim256 and inputs.hd256_generic
+            hd256_generic = inputs.is_hdim256 and not inputs.uses_dedicated_hd256_kernel
             # hdim 256 on the generic kernel runs a 64-row KV tile per CTA (NOTE [M=64
             # accumulator layout] in flash_bwd_sm100.py); the 2CTA decision sees that tile.
             tile_n = 64 if hd256_generic else 128
@@ -2777,7 +2779,9 @@ def validate_sm90_bwd_mma(config: BwdConfig, inputs: BwdHeuristicInputs) -> None
                 f"{atom_m}x{atom_n} warp groups of 64-row atoms"
             )
     smem_bytes = sm90_bwd_smem_bytes(
-        config, tile_hdim, tile_hdimv,
+        config,
+        tile_hdim,
+        tile_hdimv,
         split_d512=(inputs.head_dim, inputs.head_dim_v) == (512, 512),
     )
     if smem_bytes > SM90_SMEM_BYTES:
@@ -2846,6 +2850,10 @@ def validate_bwd_config(config: BwdConfig, inputs: BwdHeuristicInputs) -> None:
                 "learnable_sink"
             )
         if config.use_dedicated_hd256_kernel:
+            if inputs.local:
+                raise ValueError(
+                    "The dedicated SM100 hdim-256 backward does not support local attention"
+                )
             if not inputs.is_hdim256:
                 raise ValueError("The dedicated SM100 backward kernel requires head_dim=256")
             if not config.use_2cta_instrs or config.cluster_size not in (1, 2):
