@@ -313,7 +313,13 @@ def test_selection_matches_the_legacy_policy(device_arch):
             hd256_generic=hd256_generic,
         )
         try:
-            expected = outcome(lambda: legacy_bwd_policy(inputs))
+            # Local D256 now selects the same generic route as the old explicit env opt-in.
+            legacy_inputs = (
+                inputs._replace(hd256_generic=True)
+                if inputs.device_capacity in (10, 11) and inputs.is_hdim256 and inputs.local
+                else inputs
+            )
+            expected = outcome(lambda: legacy_bwd_policy(legacy_inputs))
         except LegacyKernelAssert:
             with pytest.raises(ValueError, match="requires 2CTA"):
                 select_bwd_config(inputs)
@@ -471,3 +477,27 @@ def test_sm90_d512_split_tiles_fit_shared_memory():
     assert (config.num_stages_Q, config.num_stages_dO, config.num_stages_PdS) == (1, 1, 1)
     assert config.dKV_swapAB
     validate_bwd_config(config, inputs)
+
+
+@pytest.mark.parametrize("arch", [100, 103])
+@pytest.mark.parametrize("heads,kv_heads", [(32, 16), (8, 1)])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("generic_env", [False, True])
+def test_local_hd256_uses_generic_m64(arch, heads, kv_heads, local, generic_env):
+    inputs = make_inputs(
+        device_arch=arch, head_dim=256, head_dim_v=256,
+        num_heads=heads, num_heads_kv=kv_heads, num_sms=148,
+        causal=not local, local=local, hd256_generic=generic_env,
+    )
+    config = select_bwd_config(inputs)
+    dedicated = not local and not generic_env
+    assert config.use_dedicated_hd256_kernel == dedicated
+    assert config.tile_n == (128 if dedicated else 64)
+    validate_bwd_config(config, inputs)
+
+
+def test_local_hd256_rejects_explicit_dedicated_config():
+    inputs = make_inputs(head_dim=256, head_dim_v=256)
+    config = select_bwd_config(inputs)
+    with pytest.raises(ValueError, match="does not support local attention"):
+        validate_bwd_config(config, inputs._replace(local=True))
