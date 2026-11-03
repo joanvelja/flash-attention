@@ -43,10 +43,9 @@ def legacy_sm90_tile(head_dim, head_dim_v, causal, local, sparse_q):
     elif head_dim <= 192:
         dO = 2 if head_dim_v <= 128 else 1
         values = (64, 96, 2, dO, 1, False, True, False, 1, 2, 1, False)
-    elif sparse_q is not None:
-        values = (64, 64, 1, 1, 1, False, False, False, 1, 1, 1, False)
     else:
-        values = (64, 48, 2, 1, 1, False, True, False, 1, 1, 1, False)
+        # Preserve the fork's D256 policy from 14e3c18.
+        values = (64, 64, 1, 1, 1, False, False, False, 1, 1, 1, False)
     return dict(zip(fields, values))
 
 
