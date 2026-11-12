@@ -45,6 +45,35 @@ from flash_attn.cute.block_sparse_utils import (
 )
 
 
+class _AlternatingOperandState:
+    """One token per semantic operand; both index and phase flip each tile.
+
+    Both operands share ONE two-slot pipeline. A(t+1) occupies B(t)'s retired
+    slot, and B(t+1) occupies A(t)'s retired slot. Flipping the index alone would
+    wait on the previous full generation and permit an early overwrite.
+    """
+
+    def __init__(self, phase_index: Int32):
+        self._phase_index = phase_index
+
+    @property
+    def index(self) -> Int32:
+        return self._phase_index & 1
+
+    @property
+    def phase(self) -> Int32:
+        return (self._phase_index >> 1) & 1
+
+    def advance(self):
+        self._phase_index ^= 3
+
+    def __extract_mlir_values__(self):
+        return [self._phase_index.ir_value()]
+
+    def __new_from_mlir_values__(self, values):
+        return _AlternatingOperandState(Int32(values[0]))
+
+
 class FlashAttentionBackwardSm90:
     arch = 90
 
@@ -115,6 +144,7 @@ class FlashAttentionBackwardSm90:
         # split_mode "dq": M-stationary kernel that owns the dQ tile in registers and
         # writes dq_accum once per (m_block, head) — no global reduction stream.
         # split_mode "dkv": the fused kernel with the dQ GEMM and atomic loop compiled out.
+        self.alias_stream_slots = split_mode is not None
         self.dq_owner = split_mode == "dq"
         self.fused_dq = split_mode is None
         self.compute_dkv = split_mode != "dq"
@@ -270,8 +300,16 @@ class FlashAttentionBackwardSm90:
                 major_mode_size=mms,
             )
             for shape, stage, mms in [
-                ((self.tile_m, self.tile_hdim), self.Q_stage, self.tile_hdim // wg_d_dKV),
-                ((self.tile_m, self.tile_hdimv), self.dO_stage, self.tile_hdim // wg_d_dKV),
+                (
+                    (self.tile_m, self.tile_hdim),
+                    2 if self.alias_stream_slots and not self.dq_owner else self.Q_stage,
+                    self.tile_hdim // wg_d_dKV,
+                ),
+                (
+                    (self.tile_m, self.tile_hdimv),
+                    2 if self.alias_stream_slots and not self.dq_owner else self.dO_stage,
+                    self.tile_hdim // wg_d_dKV,
+                ),
             ]
         ]
         wg_d_dQ = self.num_wg_dQ // self.AtomLayoutMdQ
@@ -280,7 +318,7 @@ class FlashAttentionBackwardSm90:
             self.dtype,
             LayoutEnum.ROW_MAJOR,
             (self.tile_n, self.tile_hdim),
-            stage=1 if self.dq_owner else None,
+            stage=2 if self.alias_stream_slots and self.dq_owner else 1 if self.dq_owner else None,
             major_mode_size=self.tile_hdim // wg_d_dQ,
         )
         # There's only V, no V.T, so layout is normal
@@ -288,7 +326,7 @@ class FlashAttentionBackwardSm90:
             self.dtype,
             LayoutEnum.ROW_MAJOR,
             (self.tile_n, self.tile_hdimv),
-            1 if self.dq_owner else None,
+            2 if self.alias_stream_slots and self.dq_owner else 1 if self.dq_owner else None,
         )
         # Accomodate both S and S.T
         wg_n_SdP = self.num_wg_mma // self.AtomLayoutMSdP
@@ -320,6 +358,26 @@ class FlashAttentionBackwardSm90:
             )
         # dKVaccum for GQA epilogue - reuses sV+sK memory recast as f32
         # TODO: assert that sVaccum and sKaccum don't overflow smem
+
+    def make_operand_state(self, user, stages, *, second=False):
+        if self.alias_stream_slots:
+            producer_phase = 1 if user is cutlass.pipeline.PipelineUserType.Producer else 0
+            return _AlternatingOperandState(Int32(2 * producer_phase + int(second)))
+        return cutlass.pipeline.make_pipeline_state(user, stages)
+
+    def resident_producer_copy_fn(self, copy, pipe):
+        if not self.alias_stream_slots:
+            return copy_utils.tma_producer_copy_fn(copy, pipe)
+
+        def copy_fn(src_idx, producer_state, **kwargs):
+            copy(
+                src_idx=src_idx,
+                dst_idx=0,
+                tma_bar_ptr=pipe.producer_get_barrier(producer_state),
+                **kwargs,
+            )
+
+        return copy_fn
 
     def _get_tiled_mma(self):
         maybe_swap_mn = lambda shape, swap: (shape[1], shape[0], *shape[2:]) if swap else shape
@@ -403,6 +461,31 @@ class FlashAttentionBackwardSm90:
         sdPsum_struct = cute.struct.Align[
             cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.dO_stage], 128
         ]
+
+        if self.alias_stream_slots:
+            # Allocate each physical operand exactly once. Q/dO are adjacent,
+            # as are V/K (V first preserves the GQA FP32 epilogue alias).
+            sQ_one = cute.struct.Align[
+                cute.struct.MemRange[self.dtype, self.tile_m * self.tile_hdim], 1024
+            ]
+            sKV_one = cute.struct.Align[
+                cute.struct.MemRange[self.dtype, self.tile_n * self.tile_hdim], 1024
+            ]
+
+            @cute.struct
+            class SharedStorageAliasedOperands:
+                mbar_ptr_Q: cute.struct.MemRange[cutlass.Int64, 4]
+                sLSE: sLSE_struct
+                sdPsum: sdPsum_struct
+                sQ: sQ_one
+                sdO: sQ_one
+                sV: sKV_one
+                sK: sKV_one
+                sP: cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
+                sdS: cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sdS], 1024]
+                sdQaccum: sdQaccum_struct
+
+            return SharedStorageAliasedOperands
 
         @cute.struct
         class SharedStorageQKV:
@@ -824,29 +907,46 @@ class FlashAttentionBackwardSm90:
         )
         pipeline_Q = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_Q.data_ptr(),
-            num_stages=self.Q_stage,
+            num_stages=2 if const_expr(self.alias_stream_slots) else self.Q_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["K"]
             if const_expr(self.dq_owner)
             else self.tma_copy_bytes["Q"] + self.tma_copy_bytes["LSE"],
-            defer_sync=True,
+            defer_sync=not self.alias_stream_slots,
         )
-        pipeline_dO = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.mbar_ptr_dO.data_ptr(),
-            num_stages=self.dO_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_bytes["V"]
-            if const_expr(self.dq_owner)
-            else self.tma_copy_bytes["dO"] + self.tma_copy_bytes["dPsum"],
-            defer_sync=False,
-        )
+        if const_expr(self.alias_stream_slots):
+            pipeline_dO = pipeline_Q
+        else:
+            pipeline_dO = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_dO.data_ptr(),
+                num_stages=self.dO_stage,
+                producer_group=pipeline_producer_group,
+                consumer_group=pipeline_consumer_group,
+                tx_count=self.tma_copy_bytes["V"]
+                if const_expr(self.dq_owner)
+                else self.tma_copy_bytes["dO"] + self.tma_copy_bytes["dPsum"],
+                defer_sync=False,
+            )
 
-        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
-        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        if const_expr(self.alias_stream_slots):
+            # The stage axis is a PHYSICAL slot. Both semantic views share its
+            # base; alternating state tokens select the right slot per tile.
+            if const_expr(self.dq_owner):
+                sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+                sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
+                sK = storage.sV.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+                sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            else:
+                sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+                sdO = storage.sQ.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
+                sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+                sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        else:
+            sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+            sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
+            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sP = None
         if const_expr(not self.mma_dkv_is_rs and self.compute_dkv):
             sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
@@ -1061,11 +1161,11 @@ class FlashAttentionBackwardSm90:
             return
 
         if warp_idx_in_wg == 0:
-            producer_state_Q = cutlass.pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
+            producer_state_Q = self.make_operand_state(
+                cutlass.pipeline.PipelineUserType.Producer, self.Q_stage, second=False
             )
-            producer_state_dO = cutlass.pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
+            producer_state_dO = self.make_operand_state(
+                cutlass.pipeline.PipelineUserType.Producer, self.dO_stage, second=True
             )
             tensormap_manager = None
             tensormap_gmem = ()
@@ -1178,9 +1278,9 @@ class FlashAttentionBackwardSm90:
                 )
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
                 load_LSE = copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE)
-                load_LSE = copy_utils.tma_producer_copy_fn(load_LSE, pipeline_Q)
+                load_LSE = self.resident_producer_copy_fn(load_LSE, pipeline_Q)
                 load_dPsum = copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum)
-                load_dPsum = copy_utils.tma_producer_copy_fn(load_dPsum, pipeline_dO)
+                load_dPsum = self.resident_producer_copy_fn(load_dPsum, pipeline_dO)
 
                 m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
@@ -1214,7 +1314,7 @@ class FlashAttentionBackwardSm90:
                         load_LSE(first_m_block, producer_state=producer_state_Q)
                         producer_state_dO_cur = (
                             producer_state_dO
-                            if const_expr(self.Q_stage != self.dO_stage)
+                            if const_expr(self.alias_stream_slots or self.Q_stage != self.dO_stage)
                             else producer_state_Q
                         )
                         pipeline_dO.producer_acquire(
@@ -1232,7 +1332,9 @@ class FlashAttentionBackwardSm90:
                             load_LSE(m_block, producer_state=producer_state_Q)
                             producer_state_dO_cur = (
                                 producer_state_dO
-                                if const_expr(self.Q_stage != self.dO_stage)
+                                if const_expr(
+                                    self.alias_stream_slots or self.Q_stage != self.dO_stage
+                                )
                                 else producer_state_Q
                             )
                             pipeline_dO.producer_acquire(producer_state_dO_cur)
@@ -1298,11 +1400,11 @@ class FlashAttentionBackwardSm90:
         # M-stationary producer: Q/dO/LSE/dPsum load once per work tile, riding the
         # first K/V stage barriers via extra_tx_count; K/V n-tiles stream through the
         # single-stage pipelines (pipeline_Q carries K, pipeline_dO carries V).
-        producer_state_K = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
+        producer_state_K = self.make_operand_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.Q_stage, second=False
         )
-        producer_state_V = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
+        producer_state_V = self.make_operand_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.dO_stage, second=True
         )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1338,18 +1440,18 @@ class FlashAttentionBackwardSm90:
                 gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (None, 0))
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (None,))
                 gdPsum = cute.local_tile(mdPsum_cur, (self.tile_m,), (None,))
-                load_Q = copy_utils.tma_producer_copy_fn(
+                load_Q = self.resident_producer_copy_fn(
                     copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ)[0],
                     pipeline_Q,
                 )
-                load_dO = copy_utils.tma_producer_copy_fn(
+                load_dO = self.resident_producer_copy_fn(
                     copy_utils.tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO)[0],
                     pipeline_dO,
                 )
-                load_LSE = copy_utils.tma_producer_copy_fn(
+                load_LSE = self.resident_producer_copy_fn(
                     copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE), pipeline_Q
                 )
-                load_dPsum = copy_utils.tma_producer_copy_fn(
+                load_dPsum = self.resident_producer_copy_fn(
                     copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum), pipeline_dO
                 )
 
@@ -1363,7 +1465,7 @@ class FlashAttentionBackwardSm90:
                 load_LSE(m_block, producer_state=producer_state_K)
                 producer_state_V_cur = (
                     producer_state_V
-                    if const_expr(self.Q_stage != self.dO_stage)
+                    if const_expr(self.alias_stream_slots or self.Q_stage != self.dO_stage)
                     else producer_state_K
                 )
                 pipeline_dO.producer_acquire(
@@ -1381,7 +1483,7 @@ class FlashAttentionBackwardSm90:
                     load_K(n_block, producer_state=producer_state_K)
                     producer_state_V_cur = (
                         producer_state_V
-                        if const_expr(self.Q_stage != self.dO_stage)
+                        if const_expr(self.alias_stream_slots or self.Q_stage != self.dO_stage)
                         else producer_state_K
                     )
                     pipeline_dO.producer_acquire(producer_state_V_cur)
@@ -1684,11 +1786,11 @@ class FlashAttentionBackwardSm90:
             is_dQ_wg=is_dQ_wg,
         )
 
-        consumer_state_Q = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
+        consumer_state_Q = self.make_operand_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage, second=False
         )
-        consumer_state_dO = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
+        consumer_state_dO = self.make_operand_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage, second=True
         )
         if const_expr(self.dq_owner):
             self.mma_dq_owner(
@@ -2034,11 +2136,11 @@ class FlashAttentionBackwardSm90:
             consumer_state_K.advance()
         # (1) [GEMM 1] S = Q @ K^T (Q resident at stage 0; carries Q/LSE on iter 0)
         pipeline_Q.consumer_wait(consumer_state_K, pipeline_Q.consumer_try_wait(consumer_state_K))
-        acc_S = mma_qk_fn(A_idx=0, B_idx=0, wg_wait=-1)
+        acc_S = mma_qk_fn(A_idx=0, B_idx=consumer_state_K.index, wg_wait=-1)
         tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, 0])
         # (2) [GEMM 2] dP = dO @ V^T
         pipeline_dO.consumer_wait(consumer_state_V, pipeline_dO.consumer_try_wait(consumer_state_V))
-        acc_dP = mma_dov_fn(A_idx=0, B_idx=0, wg_wait=1)
+        acc_dP = mma_dov_fn(A_idx=0, B_idx=consumer_state_V.index, wg_wait=1)
 
         # (3) [Pointwise 1] P = exp2(S * scale_log2 - LSE)
         if const_expr(mask_fn is not None):
@@ -2072,7 +2174,9 @@ class FlashAttentionBackwardSm90:
         PdS_barrier.arrive_and_wait()
 
         # (5) [GEMM 3] dQ[:, wg half] += dS @ K[:, wg half]
-        mma_dq_acc_fn(A_idx=smem_idx_PdS, B_idx=0, zero_init=is_first, wg_wait=-1)
+        mma_dq_acc_fn(
+            A_idx=smem_idx_PdS, B_idx=consumer_state_K.index, zero_init=is_first, wg_wait=-1
+        )
         return consumer_state_K, consumer_state_V
 
     @staticmethod
@@ -2121,21 +2225,31 @@ class FlashAttentionBackwardSm90:
         mdQaccum_cur: Optional[cute.Tensor] = None,
     ):
         consumer_state_dO_cur = (
-            consumer_state_Q if const_expr(self.Q_stage == self.dO_stage) else consumer_state_dO
+            consumer_state_Q
+            if const_expr(not self.alias_stream_slots and self.Q_stage == self.dO_stage)
+            else consumer_state_dO
         )
         smem_idx_Q = consumer_state_Q.index
-        smem_idx_dO = consumer_state_dO_cur.index if const_expr(self.dO_stage > 1) else 0
+        smem_idx_dO = (
+            consumer_state_dO_cur.index
+            if const_expr(self.alias_stream_slots or self.dO_stage > 1)
+            else 0
+        )
         smem_idx_PdS = smem_idx_Q if const_expr(self.PdS_stage > 1) else 0
         # (1) [GEMM 1] S = Q @ K^T
         pipeline_Q.consumer_wait(consumer_state_Q, pipeline_Q.consumer_try_wait(consumer_state_Q))
         acc_S = mma_qk_fn(A_idx=smem_idx_Q, wg_wait=-1)
         # If shuffle_LSE, OOB reads are OK since sLSE is already padded
-        tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, smem_idx_Q])
+        tLSErLSE = copy_utils.load_s2r(
+            tLSEsLSE[None, 0 if const_expr(self.alias_stream_slots) else smem_idx_Q]
+        )
         # (2) [GEMM 2] dP = dO @ V.T
         pipeline_dO.consumer_wait(
             consumer_state_dO_cur, pipeline_dO.consumer_try_wait(consumer_state_dO_cur)
         )
-        acc_dP = mma_dov_fn(A_idx=smem_idx_Q, wg_wait=1)
+        acc_dP = mma_dov_fn(
+            A_idx=smem_idx_dO if const_expr(self.alias_stream_slots) else smem_idx_Q, wg_wait=1
+        )
 
         if const_expr(self.score_mod_bwd is not None):
             acc_S_pre = cute.make_fragment_like(acc_S)
@@ -2155,7 +2269,9 @@ class FlashAttentionBackwardSm90:
                 acc_S_mn[r, c] = cute.math.exp2(
                     acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
                 )
-        tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
+        tLSErdPsum = copy_utils.load_s2r(
+            tLSEsdPsum[None, 0 if const_expr(self.alias_stream_slots) else smem_idx_dO]
+        )
 
         # Convert P from f32 -> f16
         tdVrP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
