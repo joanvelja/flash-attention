@@ -542,6 +542,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_warp = ThreadCooperativeGroup(1)
         load_threads = ThreadCooperativeGroup(self.num_threads_per_warp_group)
         mma_warps = ThreadCooperativeGroup(self.num_mma_threads // cute.arch.WARP_SIZE)
+        # Only the score owner reads K when P is published to the other PV warpgroup.
+        k_mma_warps = (
+            ThreadCooperativeGroup(self.num_threads_per_warp_group // cute.arch.WARP_SIZE)
+            if const_expr(self.cta_score_publication)
+            else mma_warps
+        )
         if const_expr(self.use_tma_Q):
             pipeline_q = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=mbar_ptr_Q,
@@ -567,7 +573,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
                 num_stages=self.num_stages,
                 producer_group=tma_warp,
-                consumer_group=mma_warps,
+                consumer_group=k_mma_warps,
                 tx_count=self.tma_copy_bytes["K"],
                 defer_sync=True,
             )
@@ -584,7 +590,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
                 num_stages=self.num_stages,
                 producer_group=load_threads,
-                consumer_group=mma_warps,
+                consumer_group=k_mma_warps,
                 defer_sync=True,
                 elect_one_release=True,
                 syncwarp_before_release=False,
@@ -1510,10 +1516,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         """Processes the first half block when using intra-warpgroup-overlap"""
 
-        pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
+        if const_expr(not self.cta_score_publication or is_score_owner):
+            pipeline_k.consumer_wait(
+                kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state)
+            )
         if const_expr(self.cta_score_publication):
             if const_expr(is_score_owner):
                 acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+                # QK has retired; let the producer prefetch K while softmax publishes P.
+                pipeline_k.consumer_release(kv_consumer_state)
                 mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
                 row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
                 scores_scale.store(row_scale.load())
@@ -1523,7 +1534,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
                 cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
             self.publish_score_stats(scores_scale, score_stats, qk_tidx)
-            pipeline_k.consumer_release(kv_consumer_state)
         else:
             acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
             pipeline_k.consumer_release(kv_consumer_state)
@@ -1680,7 +1690,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
-        pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        if const_expr(not self.cta_score_publication or is_score_owner):
+            pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # S = Q @ K.T
         if const_expr(self.cta_score_publication):
@@ -1697,7 +1708,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(not self.cta_score_publication):
             self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)
-        pipeline_k.consumer_release(smem_pipe_read)
+        if const_expr(not self.cta_score_publication or is_score_owner):
+            pipeline_k.consumer_release(smem_pipe_read)
 
         if const_expr(self.cta_score_publication):
             if const_expr(is_score_owner):
