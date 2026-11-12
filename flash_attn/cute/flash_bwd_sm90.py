@@ -115,6 +115,7 @@ class FlashAttentionBackwardSm90:
         # split_mode "dq": M-stationary kernel that owns the dQ tile in registers and
         # writes dq_accum once per (m_block, head) — no global reduction stream.
         # split_mode "dkv": the fused kernel with the dQ GEMM and atomic loop compiled out.
+        self.score_gemm_split = split_mode is not None
         self.dq_owner = split_mode == "dq"
         self.fused_dq = split_mode is None
         self.compute_dkv = split_mode != "dq"
@@ -324,7 +325,13 @@ class FlashAttentionBackwardSm90:
     def _get_tiled_mma(self):
         maybe_swap_mn = lambda shape, swap: (shape[1], shape[0], *shape[2:]) if swap else shape
         # S = Q @ K.T, dP = dO @ V.T
-        atom_layout_SdP = (self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1)
+        # D512 B1: one WG owns the complete S GEMM, the other the complete dP
+        # GEMM. Output MMAs retain their original two-WG ownership.
+        atom_layout_SdP = (
+            (1, 1, 1)
+            if self.score_gemm_split
+            else (self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1)
+        )
         tiler_mn_SdP = (self.tile_m // atom_layout_SdP[0], self.tile_n // atom_layout_SdP[1])
         tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
@@ -404,6 +411,8 @@ class FlashAttentionBackwardSm90:
             cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.dO_stage], 128
         ]
 
+        cosize_sP_exchange = self.tile_m * self.tile_n if self.score_gemm_split else 0
+
         @cute.struct
         class SharedStorageQKV:
             mbar_ptr_Q: cute.struct.MemRange[cutlass.Int64, self.Q_stage * 2]
@@ -417,6 +426,7 @@ class FlashAttentionBackwardSm90:
             sP: cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
             sdS: cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sdS], 1024]
             sdQaccum: sdQaccum_struct
+            sP_exchange: cute.struct.Align[cute.struct.MemRange[Float32, cosize_sP_exchange], 1024]
 
         return SharedStorageQKV
 
@@ -851,6 +861,11 @@ class FlashAttentionBackwardSm90:
         if const_expr(not self.mma_dkv_is_rs and self.compute_dkv):
             sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+        sP_exchange = (
+            storage.sP_exchange.get_tensor(cute.make_layout(self.tile_m * self.tile_n))
+            if const_expr(self.score_gemm_split)
+            else None
+        )
         sLSE = storage.sLSE.get_tensor(
             cute.make_layout(
                 (self.tile_m, self.Q_stage),
@@ -966,6 +981,7 @@ class FlashAttentionBackwardSm90:
                 sLSE,
                 sdPsum,
                 sdQaccum,
+                sP_exchange,
                 pipeline_Q,
                 pipeline_dO,
                 tidx,
@@ -1501,6 +1517,7 @@ class FlashAttentionBackwardSm90:
         sLSE: cute.Tensor,
         sdPsum: cute.Tensor,
         sdQaccum: cute.Tensor,
+        sP_exchange: Optional[cute.Tensor],
         pipeline_Q: cutlass.pipeline.PipelineAsync,
         pipeline_dO: cutlass.pipeline.PipelineAsync,
         tidx: Int32,
@@ -1612,7 +1629,10 @@ class FlashAttentionBackwardSm90:
 
         # Smem copy atom tiling for P/dS R2S
         copy_P_r2s = None
-        mms_PdS = self.tile_n // (num_wg_mma_SdP // self.AtomLayoutMSdP)
+        # Keep the base mms16 SMEM layout and its store atom even though the
+        # score producer now covers both N16 bands with a single WG.
+        num_wg_PdS_layout = self.num_wg_mma if self.score_gemm_split else num_wg_mma_SdP
+        mms_PdS = self.tile_n // (num_wg_PdS_layout // self.AtomLayoutMSdP)
         if const_expr(sP is not None):
             sP_cpy = sP if const_expr(not self.SdP_swapAB) else sPt
             copy_P_r2s, _, _ = copy_utils.get_smem_store_C(
@@ -1657,9 +1677,29 @@ class FlashAttentionBackwardSm90:
             if const_expr(self.fused_dq and not self.dQ_direct_atomic):
                 tdQsdQaccum = dQaccum_thr_copy.partition_D(sdQaccum)
 
-        PdS_barrier = cutlass.pipeline.NamedBarrier(
+        PdS_barrier_cls = (
+            pipeline.NamedBarrier if self.score_gemm_split else cutlass.pipeline.NamedBarrier
+        )
+        PdS_barrier = PdS_barrier_cls(
             barrier_id=int(NamedBarrierBwd.PdS), num_threads=self.num_mma_threads
         )
+
+        split_score_fn = None
+        if const_expr(self.score_gemm_split):
+            split_score_fn = partial(
+                self.compute_gemm_split_PdS,
+                warp_group_idx=warp_group_idx,
+                sdp_tidx=sdp_tidx,
+                sP_exchange=sP_exchange,
+                mma_qk_fn=mma_qk_fn,
+                mma_dov_fn=mma_dov_fn,
+                copy_P_r2s=copy_P_r2s,
+                copy_dS_r2s=copy_dS_r2s,
+                tLSEsLSE=tLSEsLSE,
+                tLSEsdPsum=tLSEsdPsum,
+                softmax_scale_log2=softmax_scale_log2,
+                PdS_barrier=PdS_barrier,
+            )
 
         mma_one_m_block_all = partial(
             self.mma_one_m_block,
@@ -1682,6 +1722,7 @@ class FlashAttentionBackwardSm90:
             # acc_dV=acc_dV,
             # acc_dK=acc_dK,
             is_dQ_wg=is_dQ_wg,
+            split_score_fn=split_score_fn,
         )
 
         consumer_state_Q = cutlass.pipeline.make_pipeline_state(
@@ -1713,6 +1754,7 @@ class FlashAttentionBackwardSm90:
                 qhead_per_kvhead_divmod,
                 consumer_state_Q,
                 consumer_state_dO,
+                split_score_fn,
             )
             return
 
@@ -1929,6 +1971,7 @@ class FlashAttentionBackwardSm90:
         qhead_per_kvhead_divmod: FastDivmodDivisorV2,
         consumer_state_K: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
         consumer_state_V: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        split_score_fn: Optional[Callable],
     ):
         # M-stationary consumer: each warp group owns dQ[:, wg * 256:(wg + 1) * 256] in
         # registers across the n sweep and writes its half of dq_accum exactly once.
@@ -1971,6 +2014,7 @@ class FlashAttentionBackwardSm90:
                         softmax_scale_log2=softmax_scale_log2,
                         PdS_barrier=PdS_barrier,
                         mask_fn=mask_fn,
+                        split_score_fn=split_score_fn,
                     )
                 # Retire the final dQ GEMM, free the last K/V stages.
                 warpgroup.wait_group(0)
@@ -2023,7 +2067,21 @@ class FlashAttentionBackwardSm90:
         softmax_scale_log2: Float32,
         PdS_barrier: cutlass.pipeline.NamedBarrier,
         mask_fn: Optional[Callable] = None,
+        split_score_fn: Optional[Callable] = None,
     ):
+        if const_expr(self.score_gemm_split):
+            return self.mma_one_n_block_gemm_split(
+                n_block,
+                n_block_min,
+                consumer_state_K,
+                consumer_state_V,
+                mma_dq_acc_fn,
+                pipeline_Q,
+                pipeline_dO,
+                PdS_barrier,
+                split_score_fn,
+                mask_fn,
+            )
         is_first = n_block == n_block_min
         smem_idx_PdS = n_block % self.PdS_stage
         if not is_first:
@@ -2075,6 +2133,155 @@ class FlashAttentionBackwardSm90:
         mma_dq_acc_fn(A_idx=smem_idx_PdS, B_idx=0, zero_init=is_first, wg_wait=-1)
         return consumer_state_K, consumer_state_V
 
+    @cute.jit
+    def compute_gemm_split_PdS(
+        self,
+        block_idx: Int32,
+        smem_idx_Q: Int32,
+        smem_idx_dO: Int32,
+        smem_idx_PdS: Int32,
+        mask_fn: Optional[Callable],
+        warp_group_idx: Int32,
+        sdp_tidx: Int32,
+        sP_exchange: cute.Tensor,
+        mma_qk_fn: Callable,
+        mma_dov_fn: Callable,
+        copy_P_r2s: Optional[Callable],
+        copy_dS_r2s: Callable,
+        tLSEsLSE: cute.Tensor,
+        tLSEsdPsum: cute.Tensor,
+        softmax_scale_log2: Float32,
+        PdS_barrier: cutlass.pipeline.NamedBarrier,
+    ):
+        # Each WG's C fragment covers the complete m64n32 score tile. Exchange
+        # FP32 P in fragment order: equal lane IDs own equal logical coordinates
+        # in both WGs. Consecutive lanes access consecutive FP32 shared words.
+        # P is never rounded before the dS multiply.
+        lane_idx = cute.arch.lane_idx()
+        if warp_group_idx == 0:
+            acc_S = mma_qk_fn(
+                A_idx=smem_idx_Q,
+                B_idx=0 if const_expr(self.dq_owner) else None,
+                wg_wait=0,
+            )
+            if const_expr(mask_fn is not None):
+                if const_expr(self.dq_owner):
+                    mask_fn(acc_S, n_block=block_idx)
+                else:
+                    mask_fn(acc_S, m_block=block_idx)
+            tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, smem_idx_Q])
+            acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=False)
+            for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
+                lse_val = self._get_stat(tLSErLSE, r, lane_idx, shuffle=self.shuffle_LSE)
+                for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
+                    acc_S_mn[r, c] = cute.math.exp2(
+                        acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
+                    )
+            flat_P = cute.make_tensor(acc_S.iterator, cute.make_layout(cute.size(acc_S)))
+            for i in cutlass.range_constexpr(cute.size(flat_P)):
+                sP_exchange[sdp_tidx + i * self.num_threads_per_warp_group] = flat_P[i]
+            if const_expr(self.compute_dkv):
+                tdVrP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
+                copy_P_r2s(tdVrP, dst_idx=smem_idx_PdS)
+            # Generic shared stores become visible at the first rendezvous. The
+            # async fence is also needed by the eventual dV WGMMA consumers.
+            cute.arch.fence_view_async_shared()
+            PdS_barrier.arrive_and_wait_unaligned()
+            PdS_barrier.arrive_and_wait_unaligned()
+        else:
+            acc_dP = mma_dov_fn(
+                A_idx=smem_idx_dO,
+                B_idx=0 if const_expr(self.dq_owner) else None,
+                wg_wait=0,
+            )
+            PdS_barrier.arrive_and_wait_unaligned()
+            acc_P = cute.make_fragment_like(acc_dP)
+            flat_P = cute.make_tensor(acc_P.iterator, cute.make_layout(cute.size(acc_P)))
+            for i in cutlass.range_constexpr(cute.size(flat_P)):
+                flat_P[i] = sP_exchange[sdp_tidx + i * self.num_threads_per_warp_group]
+            acc_P_mn = layout_utils.reshape_acc_to_mn(acc_P, transpose=False)
+            acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=False)
+            tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
+            for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
+                dpsum_val = self._get_stat(tLSErdPsum, r, lane_idx, shuffle=self.shuffle_dPsum)
+                for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
+                    acc_dP_mn[r, c] = acc_P_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val)
+            tdKrdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
+            copy_dS_r2s(tdKrdS, dst_idx=smem_idx_PdS)
+            cute.arch.fence_view_async_shared()
+            # This is also the FP32 P reuse acknowledgement: WG1's reads have
+            # completed before WG0 can leave and begin the following score tile.
+            PdS_barrier.arrive_and_wait_unaligned()
+
+    @cute.jit
+    def mma_one_n_block_gemm_split(
+        self,
+        n_block: Int32,
+        n_block_min: Int32,
+        consumer_state_K: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        consumer_state_V: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        mma_dq_acc_fn: Callable,
+        pipeline_Q: cutlass.pipeline.PipelineAsync,
+        pipeline_dO: cutlass.pipeline.PipelineAsync,
+        PdS_barrier: cutlass.pipeline.NamedBarrier,
+        split_score_fn: Callable,
+        mask_fn: Optional[Callable],
+    ):
+        is_first = n_block == n_block_min
+        if not is_first:
+            warpgroup.wait_group(0)
+            pipeline_Q.consumer_release(consumer_state_K)
+            consumer_state_K.advance()
+        pipeline_Q.consumer_wait(consumer_state_K, pipeline_Q.consumer_try_wait(consumer_state_K))
+        pipeline_dO.consumer_wait(consumer_state_V, pipeline_dO.consumer_try_wait(consumer_state_V))
+        # The existing two-stage dS proof still holds: iteration n-1's second
+        # rendezvous follows both WGs' retirement of dQ(n-2), the old reader of
+        # buffer n%2. No new dQ accumulator or epilogue layout is introduced.
+        smem_idx_PdS = n_block % self.PdS_stage
+        split_score_fn(n_block, 0, 0, smem_idx_PdS, mask_fn)
+        # Both WGs contribute exactly once to the original eight-warp release;
+        # WG1's dP has completed before the second score rendezvous.
+        pipeline_dO.consumer_release(consumer_state_V)
+        consumer_state_V.advance()
+        mma_dq_acc_fn(A_idx=smem_idx_PdS, B_idx=0, zero_init=is_first, wg_wait=-1)
+        return consumer_state_K, consumer_state_V
+
+    @cute.jit
+    def mma_one_m_block_gemm_split(
+        self,
+        m_block: Int32,
+        consumer_state_Q: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        consumer_state_dO: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        mma_pdo_fn: Callable,
+        mma_dsq_fn: Callable,
+        pipeline_Q: cutlass.pipeline.PipelineAsync,
+        pipeline_dO: cutlass.pipeline.PipelineAsync,
+        PdS_barrier: cutlass.pipeline.NamedBarrier,
+        split_score_fn: Callable,
+        mask_fn: Optional[Callable],
+        dKV_accumulate: Boolean,
+    ):
+        # The initial B1 keeps the single-stage Q/dO and P/dS protocol. It changes
+        # score-GEMM ownership only; C5 is a separately measured later candidate.
+        assert self.Q_stage == self.dO_stage == self.PdS_stage == 1
+        pipeline_Q.consumer_wait(consumer_state_Q, pipeline_Q.consumer_try_wait(consumer_state_Q))
+        pipeline_dO.consumer_wait(
+            consumer_state_dO, pipeline_dO.consumer_try_wait(consumer_state_dO)
+        )
+        # Each WG retired its previous dK/dV before releasing Q/dO. This
+        # rendezvous prevents either writer reusing P/dS before the OTHER WG has
+        # reached the same retirement point. It is required even on first use.
+        PdS_barrier.arrive_and_wait()
+        split_score_fn(m_block, 0, 0, 0, mask_fn)
+        mma_pdo_fn(A_idx=0, B_idx=0, zero_init=not dKV_accumulate, wg_wait=-1)
+        mma_dsq_fn(A_idx=0, B_idx=0, zero_init=not dKV_accumulate, wg_wait=1)
+        pipeline_dO.consumer_release(consumer_state_dO)
+        warpgroup.wait_group(0)
+        pipeline_Q.consumer_release(consumer_state_Q)
+        consumer_state_Q.advance()
+        consumer_state_dO.advance()
+        return consumer_state_Q, consumer_state_dO
+
     @staticmethod
     @cute.jit
     def _get_stat(tSrS: cute.Tensor, row: Int32, lane: Int32, shuffle: bool) -> Float32:
@@ -2119,7 +2326,22 @@ class FlashAttentionBackwardSm90:
         score_mod_bwd_fn: Optional[Callable] = None,
         dKV_accumulate: Boolean = True,
         mdQaccum_cur: Optional[cute.Tensor] = None,
+        split_score_fn: Optional[Callable] = None,
     ):
+        if const_expr(self.score_gemm_split):
+            return self.mma_one_m_block_gemm_split(
+                m_block,
+                consumer_state_Q,
+                consumer_state_dO,
+                mma_pdo_fn,
+                mma_dsq_fn,
+                pipeline_Q,
+                pipeline_dO,
+                PdS_barrier,
+                split_score_fn,
+                mask_fn,
+                dKV_accumulate,
+            )
         consumer_state_dO_cur = (
             consumer_state_Q if const_expr(self.Q_stage == self.dO_stage) else consumer_state_dO
         )
