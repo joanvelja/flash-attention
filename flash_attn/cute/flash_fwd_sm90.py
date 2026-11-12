@@ -83,20 +83,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mSeqUsedK,
     ) -> bool:
         return (
-            self.dtype == cutlass.BFloat16
-            and self.tile_hdim == 512
+            self.tile_hdim == 512
             and self.tile_hdimv == 512
             and self.tile_m == 64
             and self.tile_n == 64
             and self.num_wg_mma == 2
-            and self.is_causal
-            and not self.is_local
-            and self.qhead_per_kvhead in (4, 8)
+            and self.qhead_per_kvhead in (4, 8, 16)
+            # Publication requires Q loaded through TMA, not the SIMT-Q path.
+            and self.use_tma_Q
             and not self.mma_pv_is_rs
             and self.intra_wg_overlap
             and self.score_mod is None
             and self.mask_mod is None
             and blocksparse_tensors is None
+            # Publication calls softmax.finalize() without sink_val.
             and learnable_sink is None
             and aux_data.tensors is None
             and aux_data.scalars is None
@@ -273,7 +273,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         self.use_tma_O = self.use_tma_Q
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
-        # Score publication is limited to preregistered production GQA4/8; GQA16 stays generic.
         self.cta_score_publication = self._supports_cta_score_publication(
             blocksparse_tensors,
             learnable_sink,
