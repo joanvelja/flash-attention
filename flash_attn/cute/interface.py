@@ -2221,7 +2221,7 @@ def _flash_attn_bwd(
         scratch_shape = (scratch_heads, total_q_rows_rounded_padded)
     dq_accum = (
         None
-        if use_dedicated_hd256_kernel
+        if use_dedicated_hd256_kernel or use_sm90_d512_split
         else torch.empty(
             *scratch_shape[:-1], scratch_shape[-1] * head_dim_rounded,
             dtype=torch.float32, device=device,
@@ -2318,7 +2318,7 @@ def _flash_attn_bwd(
     dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
-    # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
+    # Direct-output kernels pass no dQ scratch; preprocess only fills dpsum/lse_log2.
     _bwd_preprocess(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
@@ -2607,7 +2607,8 @@ def _flash_attn_bwd(
         sparse_tensors_compile = None
         if normalized_block_sparse_tensors is not None:
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
-        dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
+        if use_dedicated_hd256_kernel or use_sm90_d512_split:
+            dq_accum_tensor = dq_tensor
 
         compile_args = [
             fa_bwd_obj,
@@ -2661,7 +2662,8 @@ def _flash_attn_bwd(
         compiled_bwd = cute.compile(*compile_args, options="--enable-tvm-ffi")
         _flash_attn_bwd.compile_cache[compile_key] = compiled_bwd
     if not fake_mode:
-        dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
+        if use_dedicated_hd256_kernel or use_sm90_d512_split:
+            dq_accum = dq
         call_args = [
             q.detach(),
             k.detach(),
@@ -2726,27 +2728,26 @@ def _flash_attn_bwd(
             num_threads_post_dQ = 128
             num_threads_post_dKV = 128
 
-        # The split dq kernel owns its tile and stores dq_accum in the plain
-        # (M * K // num_wg, num_wg) convention; only the fused kernel's atomic path
-        # uses the lane-contiguous scratch layout.
-        _bwd_postprocess_convert(
-            dq_accum, dq, softmax_scale,
-            cu_seqlens_q, seqused_q,
-            arch, dtype, head_dim, tile_m, num_threads_post_dQ,
-            config.AtomLayoutMdQ, config.dQ_swapAB,
-            dQ_accum_lane_contiguous=dQ_accum_lane_contiguous and not use_sm90_d512_split,
-            use_2cta_instrs=config.use_2cta_instrs, cluster_size=1,
-            accum_order=dQaccum_order,
-            cu_total_m_blocks=cu_total_m_blocks_q,
-            sink_tensors=(
-                LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
-                if learnable_sink is not None
-                else None
-            ),
-            fake_mode=fake_mode,
-            hdim_multiple_of=hdim_multiple_of,
-            pack_factor=qhead_per_kvhead if bwd_pack_gqa else 1,
-        )
+        # Split SM90 D512 owns the complete dQ tile and stores the final dtype.
+        if not use_sm90_d512_split:
+            _bwd_postprocess_convert(
+                dq_accum, dq, softmax_scale,
+                cu_seqlens_q, seqused_q,
+                arch, dtype, head_dim, tile_m, num_threads_post_dQ,
+                config.AtomLayoutMdQ, config.dQ_swapAB,
+                dQ_accum_lane_contiguous=dQ_accum_lane_contiguous,
+                use_2cta_instrs=config.use_2cta_instrs, cluster_size=1,
+                accum_order=dQaccum_order,
+                cu_total_m_blocks=cu_total_m_blocks_q,
+                sink_tensors=(
+                    LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
+                    if learnable_sink is not None
+                    else None
+                ),
+                fake_mode=fake_mode,
+                hdim_multiple_of=hdim_multiple_of,
+                pack_factor=qhead_per_kvhead if bwd_pack_gqa else 1,
+            )
 
         if dKV_postprocess:
             # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
