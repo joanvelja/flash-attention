@@ -113,7 +113,7 @@ class FlashAttentionBackwardSm90:
         self.num_wg_mma = (self.num_threads // 128) - 1
         assert split_mode in (None, "dq", "dkv")
         # split_mode "dq": M-stationary kernel that owns the dQ tile in registers and
-        # writes dq_accum once per (m_block, head) — no global reduction stream.
+        # writes final dQ once per (m_block, head) — no global reduction stream.
         # split_mode "dkv": the fused kernel with the dQ GEMM and atomic loop compiled out.
         self.dq_owner = split_mode == "dq"
         self.fused_dq = split_mode is None
@@ -245,8 +245,14 @@ class FlashAttentionBackwardSm90:
             raise TypeError("LSE tensor must be Float32")
         if const_expr(mdPsum_type not in [Float32]):
             raise TypeError("dPsum tensor must be Float32")
-        if const_expr(mdQaccum_type not in [Float32]):
-            raise TypeError("dQaccum tensor must be Float32")
+        if const_expr(self.dq_owner):
+            if const_expr(mdQaccum_type != mQ_type):
+                raise TypeError("The dQ owner writes dQ in the input data type")
+        elif const_expr(self.fused_dq):
+            if const_expr(mdQaccum_type not in [Float32]):
+                raise TypeError("dQaccum tensor must be Float32")
+        else:
+            assert mdQaccum_type is None, "The dKV-only kernel does not consume dQ"
         if const_expr(self.qhead_per_kvhead == 1):
             if const_expr(not (mdK_type == mdV_type == mQ_type)):
                 raise TypeError("mdK and mdV tensors must have the same data type as mQ")
@@ -429,7 +435,7 @@ class FlashAttentionBackwardSm90:
         mdO: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
-        mdQaccum: cute.Tensor,
+        mdQaccum: Optional[cute.Tensor],
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         softmax_scale: Float32,
@@ -490,10 +496,13 @@ class FlashAttentionBackwardSm90:
             accum_transpose = [2, 1, 0] if cute.rank(mdK.shape) == 3 else [1, 0]
             mdK, mdV = [layout_utils.select(t, accum_transpose) for t in (mdK, mdV)]
         # Non-varlen stats are (b, n, s), varlen stats are (n, s).
-        LSE_dPsum_dQaccum_transpose = [2, 1, 0] if cute.rank(mLSE.shape) == 3 else [1, 0]
-        mLSE, mdPsum, mdQaccum = [
-            layout_utils.select(t, LSE_dPsum_dQaccum_transpose) for t in (mLSE, mdPsum, mdQaccum)
-        ]
+        stats_transpose = [2, 1, 0] if cute.rank(mLSE.shape) == 3 else [1, 0]
+        mLSE, mdPsum = [layout_utils.select(t, stats_transpose) for t in (mLSE, mdPsum)]
+        if const_expr(self.dq_owner):
+            # The split wrapper passes final dQ in this argument slot, not FP32 scratch.
+            mdQaccum = _qkv_transpose(mdQaccum)
+        elif const_expr(self.fused_dq):
+            mdQaccum = layout_utils.select(mdQaccum, stats_transpose)
 
         tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ = self._get_tiled_mma()
         # (batch, num_head, num_m_blocks, cluster_size) -> (num_m_blocks, cluster_size, num_head, batch)
@@ -585,6 +594,19 @@ class FlashAttentionBackwardSm90:
             cute.select(self.sdO_layout, mode=[0, 1]),
             (self.tile_m, self.tile_hdimv),
         )
+        tma_atom_dQ = None
+        if const_expr(self.dq_owner):
+            mdQ_tma = (
+                copy_utils.create_ragged_tensor_for_tma(mdQaccum, ragged_dim=0, ptr_shift=True)
+                if self.is_varlen_q
+                else mdQaccum
+            )
+            tma_atom_dQ, mdQaccum = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                mdQ_tma,
+                cute.select(self.sQ_layout, mode=[0, 1]),
+                (self.tile_m, self.tile_hdim),
+            )
         if const_expr(self.qhead_per_kvhead == 1):
             mdK_tma = (
                 copy_utils.create_ragged_tensor_for_tma(mdK, ragged_dim=0, ptr_shift=True)
@@ -716,6 +738,7 @@ class FlashAttentionBackwardSm90:
             tma_atom_dO,
             tma_atom_dK,
             tma_atom_dV,
+            tma_atom_dQ,
             mLSE,
             mdPsum,
             mdQaccum,
@@ -774,9 +797,10 @@ class FlashAttentionBackwardSm90:
         tma_atom_dO: cute.CopyAtom,
         tma_atom_dK: cute.CopyAtom,
         tma_atom_dV: cute.CopyAtom,
+        tma_atom_dQ: Optional[cute.CopyAtom],
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
-        mdQaccum: cute.Tensor,
+        mdQaccum: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
@@ -811,7 +835,15 @@ class FlashAttentionBackwardSm90:
 
         # prefetch TMA descriptors
         if warp_idx == 0:
-            for atom in [tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO, tma_atom_dK, tma_atom_dV]:
+            for atom in [
+                tma_atom_Q,
+                tma_atom_K,
+                tma_atom_V,
+                tma_atom_dO,
+                tma_atom_dK,
+                tma_atom_dV,
+                tma_atom_dQ,
+            ]:
                 if const_expr(atom is not None):
                     cpasync.prefetch_descriptor(atom)
 
@@ -971,6 +1003,7 @@ class FlashAttentionBackwardSm90:
                 tidx,
                 tma_atom_dK,
                 tma_atom_dV,
+                tma_atom_dQ,
                 r2s_tiled_copy_dQaccum,
                 softmax_scale_log2,
                 softmax_scale,
@@ -1491,7 +1524,7 @@ class FlashAttentionBackwardSm90:
         mdV: cute.Tensor,
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
-        mdQaccum: cute.Tensor,
+        mdQaccum: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1506,6 +1539,7 @@ class FlashAttentionBackwardSm90:
         tidx: Int32,
         tma_atom_dK: cute.CopyAtom,
         tma_atom_dV: cute.CopyAtom,
+        tma_atom_dQ: Optional[cute.CopyAtom],
         r2s_tiled_copy_dQaccum: cute.TiledCopy,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
@@ -1702,7 +1736,11 @@ class FlashAttentionBackwardSm90:
                 tLSEsLSE,
                 tLSEsdPsum,
                 mdQaccum,
-                dQaccum_thr_copy,
+                sQ[None, None, 0],
+                tma_atom_dQ,
+                tiled_mma_dQ,
+                tidx,
+                softmax_scale,
                 softmax_scale_log2,
                 PdS_barrier,
                 thr_mma_SdP,
@@ -1917,8 +1955,12 @@ class FlashAttentionBackwardSm90:
         pipeline_dO: cutlass.pipeline.PipelineAsync,
         tLSEsLSE: cute.Tensor,
         tLSEsdPsum: cute.Tensor,
-        mdQaccum: cute.Tensor,
-        dQaccum_thr_copy: cute.TiledCopy,
+        mdQ: cute.Tensor,
+        sdQ: cute.Tensor,
+        tma_atom_dQ: cute.CopyAtom,
+        tiled_mma_dQ: cute.TiledMma,
+        tidx: Int32,
+        softmax_scale: Float32,
         softmax_scale_log2: Float32,
         PdS_barrier: cutlass.pipeline.NamedBarrier,
         thr_mma_SdP: cute.ThrMma,
@@ -1931,7 +1973,16 @@ class FlashAttentionBackwardSm90:
         consumer_state_V: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
     ):
         # M-stationary consumer: each warp group owns dQ[:, wg * 256:(wg + 1) * 256] in
-        # registers across the n sweep and writes its half of dq_accum exactly once.
+        # registers across the n sweep and writes final dQ exactly once.
+        # This alias is safe only with the nonpersistent, single-work-tile scheduler:
+        # the producer loads sQ once, and both consumer WGs retire all Q reads below.
+        copy_dQ_r2s, _, _ = copy_utils.get_smem_store_C(
+            tiled_mma_dQ, sdQ, tidx, position_independent=True
+        )
+        epi_barrier = cutlass.pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierBwd.Epilogue), num_threads=self.num_mma_threads
+        )
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1976,31 +2027,30 @@ class FlashAttentionBackwardSm90:
                 warpgroup.wait_group(0)
                 pipeline_Q.consumer_release(consumer_state_K)
                 consumer_state_K.advance()
-                # dq_accum tile store: plain (M * K // num_wg, num_wg) convention, the
-                # exact inverse of the postprocess s2r (dQ_accum_lane_contiguous=False).
-                if const_expr(not seqlen.has_cu_seqlens_q):
-                    mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
-                else:
-                    mdQaccum_cur = cute.domain_offset(
-                        (seqlen.padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
-                    )
-                mdQaccum_tile = cute.domain_offset(
-                    (m_block * self.tile_m * self.tile_hdim,), mdQaccum_cur
-                )
-                gdQaccum = cute.make_tensor(
-                    mdQaccum_tile.iterator,
-                    cute.make_layout(
-                        (self.tile_m * self.tile_hdim // self.num_wg_dQ, self.num_wg_dQ)
-                    ),
-                )
-                tdQgdQaccum = dQaccum_thr_copy.partition_D(gdQaccum)
-                tdQrdQaccum_flat = cute.make_tensor(
-                    acc_dQ.iterator, cute.make_layout(tdQgdQaccum.shape)
-                )
-                assert cute.size(tdQrdQaccum_flat) == cute.size(tdQgdQaccum)
-                cute.autovec_copy(tdQrdQaccum_flat, tdQgdQaccum)
-            # else: no keys attend to this m tile (possible when seqlen_k < seqlen_q);
-            # the preprocess zero-fill already wrote the correct all-zero dq_accum rows.
+            else:
+                # No K tile attends to these Q rows. Preprocess no longer zero-fills
+                # a scratch buffer, so this CTA must explicitly write its zero output.
+                acc_dQ.fill(0.0)
+
+            # Both WGs read all of Q for S. Retiring only our own WGMMA is not enough:
+            # rendezvous before either WG reuses sQ as the final dQ store buffer.
+            epi_barrier.arrive_and_wait()
+            acc_dQ.store(acc_dQ.load() * softmax_scale)
+            copy_dQ_r2s(acc_dQ, dst_idx=None)
+            cute.arch.fence_view_async_shared()
+            epi_barrier.arrive_and_wait()
+
+            mdQ_cur = seqlen.offset_batch_Q(mdQ, batch_idx, dim=3, ragged=self.is_varlen_q)[
+                None, None, head_idx
+            ]
+            gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+            store_dQ, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_dQ, 0, cute.make_layout(1), sdQ, gdQ, single_stage=True
+            )
+            if warp_idx == 4:
+                store_dQ()
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -2606,7 +2656,7 @@ class FlashAttentionBackwardSm90Split:
         mdO: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
-        mdQaccum: cute.Tensor,
+        mdQ: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         softmax_scale: Float32,
@@ -2633,7 +2683,7 @@ class FlashAttentionBackwardSm90Split:
             mdO,
             mLSE,
             mdPsum,
-            mdQaccum,
+            mdQ,
             mdK,
             mdV,
             softmax_scale,
@@ -2659,7 +2709,7 @@ class FlashAttentionBackwardSm90Split:
             mdO,
             mLSE,
             mdPsum,
-            mdQaccum,
+            None,  # dKV-only kernel has no dQ output or accumulator
             mdK,
             mdV,
             softmax_scale,
